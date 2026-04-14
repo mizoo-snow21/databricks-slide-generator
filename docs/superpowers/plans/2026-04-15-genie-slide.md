@@ -6,7 +6,7 @@
 
 **Architecture:** React frontend (template/dashboard selection + prompt) → FastAPI backend → Dashboard API for widget data → Playwright for chart screenshots → Foundation Model API for slide composition → gslides_builder.py for Google Slides output.
 
-**Tech Stack:** React, TypeScript, Python, FastAPI, Playwright, Databricks SDK, Foundation Model API, Google Slides API (via gslides_builder.py), Unity Catalog
+**Tech Stack:** React, TypeScript, Python, FastAPI, Playwright, Databricks SDK, Foundation Model API, Google Slides API (via gslides_builder.py), Unity Catalog, uv (Python package management)
 
 **Spec:** `docs/superpowers/specs/2026-04-15-genie-slide-design.md`
 
@@ -32,7 +32,7 @@ genie-slide/
 │   │   ├── llm_service.py            # Foundation Model API composition
 │   │   ├── slides_service.py         # gslides_builder.py wrapper
 │   │   └── google_auth_service.py    # Google OAuth flow
-│   └── requirements.txt
+│   └── pyproject.toml              # uv managed dependencies
 ├── frontend/
 │   ├── package.json
 │   ├── tsconfig.json
@@ -70,7 +70,7 @@ genie-slide/
 - Create: `app.yaml`
 - Create: `backend/main.py`
 - Create: `backend/config.py`
-- Create: `backend/requirements.txt`
+- Create: `backend/pyproject.toml`
 - Create: `frontend/package.json`
 - Create: `frontend/vite.config.ts`
 - Create: `frontend/tsconfig.json`
@@ -86,24 +86,42 @@ command:
   - /bin/bash
   - -c
   - |
-    cd frontend && npm install && npm run build && \
-    cd ../backend && pip install -r requirements.txt && \
-    playwright install --with-deps chromium && \
-    uvicorn main:app --host 0.0.0.0 --port 8000
+    cd backend && uv run uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-Note: FastAPI serves the frontend build from `../frontend/dist` via `StaticFiles` mount and a catch-all route (see `backend/main.py` below). The single `uvicorn` process serves both the API and the React SPA.
+Note: All dependencies (Python via `uv sync`, npm via `npm install && npm run build`, Playwright via `uv run playwright install --with-deps chromium`) are installed at **build time** before deployment, not at runtime. The `app.yaml` command only starts the server. FastAPI serves the pre-built frontend from `../frontend/dist` via `StaticFiles` mount and a catch-all route (see `backend/main.py` below).
 
-- [ ] **Step 2: Create backend/requirements.txt**
+**Build script (`scripts/build.sh`, run before `databricks apps deploy`):**
+```bash
+#!/bin/bash
+set -e
+cd frontend && npm install && npm run build
+cd ../backend && uv sync && uv run playwright install --with-deps chromium
+``` The single `uvicorn` process serves both the API and the React SPA.
 
+- [ ] **Step 2: Create backend/pyproject.toml**
+
+```toml
+[project]
+name = "genie-slide-backend"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "databricks-sdk>=0.30.0",
+    "pydantic>=2.9.0",
+    "playwright>=1.47.0",
+    "httpx>=0.27.0",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0.0",
+]
 ```
-fastapi==0.115.0
-uvicorn==0.30.0
-databricks-sdk==0.30.0
-pydantic==2.9.0
-playwright==1.47.0
-httpx==0.27.0
-```
+
+Then run: `cd backend && uv sync`
 
 - [ ] **Step 3: Create backend/config.py**
 
@@ -268,7 +286,7 @@ export default function App() {
 
 - [ ] **Step 6: Verify backend starts**
 
-Run: `cd backend && pip install -r requirements.txt && python -c "from main import app; print('OK')"`
+Run: `cd backend && uv sync && uv run python -c "from main import app; print('OK')"`
 Expected: `OK`
 
 - [ ] **Step 7: Commit**
@@ -2946,7 +2964,7 @@ touch backend/vendor/__init__.py
 - [ ] **Step 2: Install Playwright browsers**
 
 ```bash
-cd backend && pip install playwright && playwright install chromium
+cd backend && uv run playwright install chromium
 ```
 
 - [ ] **Step 3: Verify full test suite**

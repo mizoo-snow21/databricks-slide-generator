@@ -284,6 +284,7 @@ gslides_builder.py
 |-------|-----------|--------|
 | Frontend | React + TypeScript | Databricks App standard |
 | Backend | Python + FastAPI | Databricks App standard, gslides_builder.py compatibility |
+| Package management | uv + pyproject.toml | Fast, lockfile-based Python dependency management |
 | LLM | Foundation Model API | Stays within Databricks platform |
 | Dashboard data | Lakeview Dashboard API + SQL Statements API | Widget definitions and query results |
 | Chart capture | Playwright | Proven by Export Wizard |
