@@ -13,10 +13,6 @@ dependencies = [
     "pydantic-settings>=2.5.0",
 ]
 
-[[tool.uv.index]]
-url = "https://pypi.org/simple/"
-default = true
-
 [tool.uv]
 package = false
 dev-dependencies = [
