@@ -6,10 +6,6 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from config import get_settings
-
-get_settings()
-
 app = FastAPI(title="Genie Slide", version="0.1.0")
 
 FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"

@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _default_gslides_builder_path() -> str:
+    return str(Path(__file__).parent / "vendor" / "gslides_builder.py")
 
 
 class Settings(BaseSettings):
@@ -16,7 +22,7 @@ class Settings(BaseSettings):
     databricks_token: str = ""
     uc_catalog: str = "genie_slide"
     uc_schema: str = "app"
-    gslides_builder_path: str = ""
+    gslides_builder_path: str = Field(default_factory=_default_gslides_builder_path)
     google_client_id: str = ""
     google_client_secret: str = ""
 
