@@ -1,0 +1,25 @@
+# Databricks Asset Bundle for the Genie Slide app.
+#
+# The bundle has NO hardcoded workspace. Deploy into YOUR workspace by
+# authenticating with a Databricks CLI profile (its host is used), e.g.:
+#   databricks bundle deploy -p <your-profile>
+#   databricks bundle run genie_slide -p <your-profile>
+# (Alternatively set DATABRICKS_HOST + auth env vars instead of a profile.)
+#
+# Note: Databricks bundles do NOT support a variable for workspace.host
+# (it's an auth field) — the host comes from your profile / DATABRICKS_HOST.
+bundle:
+  name: genie-slide
+
+include:
+  - resources/*.yml
+
+variables:
+  app_name:
+    description: Databricks App name to create/update.
+    default: genie-slide
+
+targets:
+  dev:
+    default: true
+    mode: development

@@ -1,0 +1,25 @@
+command:
+  [
+    "/bin/bash",
+    "-c",
+    "cd backend && uv run uvicorn main:app --host 0.0.0.0 --port 8000",
+  ]
+
+env:
+  # Main endpoint: initial outline + full deck-HTML build.
+  - name: SERVING_ENDPOINT
+    value: databricks-claude-opus-4-7
+  # Editor-time endpoint: comment apply, slide add, slide regen.
+  # Uses a lighter model to dodge per-principal rate limits on Opus
+  # during iterative editing.
+  - name: EDIT_SERVING_ENDPOINT
+    value: databricks-claude-sonnet-4-6
+
+user_api_scopes:
+  - sql
+  # Genie Conversation API (list spaces, ask questions) runs on the user's
+  # behalf, so the OBO token must carry the Genie scope. The bundle's app
+  # resource (resources/genie-slide.app.yml) also declares this so a fresh
+  # `databricks bundle deploy` sets it at the app level on create.
+  - dashboards.genie
+# iam.access-control:read and iam.current-user:read are auto-granted by the platform.

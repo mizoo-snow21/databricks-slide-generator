@@ -1,0 +1,14 @@
+resources:
+  apps:
+    genie_slide:
+      name: ${var.app_name}
+      description: "Generate editable slide decks from Databricks Genie spaces."
+      # Repo root: contains app.yaml + backend/ + prebuilt frontend/dist.
+      source_code_path: ..
+      # On-behalf-of-user scopes. dashboards.genie is REQUIRED for the Genie
+      # Conversation API (list spaces, ask questions); declaring it here makes
+      # `bundle deploy` set it at the app level on create. Users approve the
+      # consent on first open.
+      user_api_scopes:
+        - sql
+        - dashboards.genie
