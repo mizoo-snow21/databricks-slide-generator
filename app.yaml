@@ -7,8 +7,12 @@ command:
 
 env:
   # Main endpoint: initial outline + full deck-HTML build.
+  # Sonnet 4.6 for speed: Opus 4.7 made deck-HTML generation slow
+  # (~140s/call) and timeout-prone. Sonnet follows the strict layout/
+  # design-token contract well. Switch back to databricks-claude-opus-4-7
+  # for max composition quality if you can tolerate the latency.
   - name: SERVING_ENDPOINT
-    value: databricks-claude-opus-4-7
+    value: databricks-claude-sonnet-4-6
   # Editor-time endpoint: comment apply, slide add, slide regen.
   # Uses a lighter model to dodge per-principal rate limits on Opus
   # during iterative editing.
