@@ -1,4 +1,4 @@
-# Genie Slide
+# Databricks Slide Generator
 
 A Databricks App that turns **Genie spaces** into editable presentation decks.
 
