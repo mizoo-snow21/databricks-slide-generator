@@ -125,5 +125,21 @@ export interface DeckMutationResponse {
   revision_no: number;
 }
 
+export interface DeckJobStatus {
+  job_id: string;
+  status: "running" | "done" | "error";
+  deck_id?: string | null;
+  error?: string | null;
+  status_code?: number | null;
+}
+
+export interface OutlineJobStatus {
+  job_id: string;
+  status: "running" | "done" | "error";
+  slides?: OutlineSlide[] | null;
+  error?: string | null;
+  status_code?: number | null;
+}
+
 export type SelectedElementRect = { x: number; y: number; w: number; h: number };
 export type SelectedElement = { target_id: string; rect: SelectedElementRect };

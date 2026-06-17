@@ -8,6 +8,7 @@ import sys
 import zipfile
 import time as _time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 from typing import Annotated, Any
@@ -24,18 +25,22 @@ from fastapi import (
 )
 from fastapi.responses import HTMLResponse, Response
 
-from auth.user_workspace import build_default_workspace_client, get_user_workspace_client
+from auth.user_workspace import (
+    build_default_workspace_client,
+    get_user_workspace_client,
+)
 from models import (
     AddSlideRequest,
     AuditIssue,
     AuditResponse,
     ChartAugmentation,
     Deck,
+    DeckJobResponse,
     DeckMutationResponse,
     RegenerateSlideRequest,
     GenerationRequest,
+    OutlineJobResponse,
     OutlineRequest,
-    OutlineResponse,
     OutlineSlide,
     PendingComment,
     SaveCommentRequest,
@@ -44,6 +49,7 @@ from models import (
 )
 from routers.templates import templates_service
 from services.brand_styles import CATEGORY_PALETTE_BY_PRESET
+from services.deck_job_store import DeckJobStore
 from services.deck_service import DeckMemoryRepo, DeckService, DeckValidationError
 from services import genie_service
 from services.genie_service import summarize_widget_rows
@@ -56,6 +62,8 @@ _deck_llm = LLMService(workspace_client=build_default_workspace_client())
 _STATE_DIR = os.environ.get("GENIE_SLIDE_STATE_DIR", "./data")
 deck_repo = DeckMemoryRepo(persist_path=os.path.join(_STATE_DIR, "decks.json"))
 deck_service = DeckService(llm=_deck_llm, repo=deck_repo)
+deck_job_store = DeckJobStore()
+_deck_job_executor = ThreadPoolExecutor(max_workers=2)
 
 _PPTX_TEMPLATE_CACHE_DIR = Path("/tmp/genie-slide-pptx-templates")
 _PPTX_TEMPLATE_URLS = {
@@ -264,6 +272,45 @@ def _bg_tone_for_preset(preset_id: str | None) -> str:
     return "dark" if preset_id in _DARK_TONE_PRESETS else "light"
 
 
+def _is_aggregate_numeric(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, (int, float))
+
+
+def _field_stats_for_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Cheap per-field stats from sampled rows for LLM chart design."""
+    if not rows:
+        return {}
+    keys_ordered: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for key in row:
+            if key not in seen:
+                seen.add(key)
+                keys_ordered.append(key)
+
+    stats: dict[str, dict[str, Any]] = {}
+    for field in keys_ordered:
+        distinct: set[Any] = set()
+        numeric_vals: list[float] = []
+        for row in rows:
+            if field not in row:
+                continue
+            value = row[field]
+            if value is None or value == "":
+                continue
+            distinct.add(value)
+            if _is_aggregate_numeric(value):
+                numeric_vals.append(float(value))
+        entry: dict[str, Any] = {"distinct_count": len(distinct)}
+        if numeric_vals:
+            entry["min"] = min(numeric_vals)
+            entry["max"] = max(numeric_vals)
+        stats[field] = entry
+    return stats
+
+
 def _prerender_widget_chart_data_uris(
     widgets: list[WidgetInfo],
     rows_by_widget: dict[str, list[dict[str, Any]]],
@@ -317,6 +364,7 @@ def _prerender_widget_chart_data_uris(
                 "rows_sample": rlist[:10],
                 "row_count": len(rlist),
                 "aggregates": summarize_widget_rows(rlist),
+                "field_stats": _field_stats_for_rows(rlist),
             }
         )
 
@@ -349,7 +397,9 @@ def _prerender_widget_chart_data_uris(
             continue
         spec = widget_spec_from_columns(w.title, w.columns, rows)
         try:
-            cleaned_rows, n_dropped = _filter_nulls_for_chart(spec, rows)
+            aug = augmentations_by_wid.get(w.widget_id)
+            design = aug.design if aug is not None else None
+            cleaned_rows, n_dropped = _filter_nulls_for_chart(spec, rows, design=design)
             if n_dropped > 0:
                 errors[w.widget_id] = (
                     f"chart skipped {n_dropped} row(s) with NULL in axis/color fields"
@@ -359,16 +409,22 @@ def _prerender_widget_chart_data_uris(
                 cleaned_rows,
                 bg_tone=bg_tone,
                 palette=palette,
+                design=design,
+                accent_color=(tok.get("palette") or {}).get("accent"),
             )
             if not vl:
                 errors[w.widget_id] = "vega-lite conversion returned empty"
                 _log(f"widget {w.widget_id} ({w.title}): vega conversion None")
                 continue
-            aug = augmentations_by_wid.get(w.widget_id)
             if aug is not None:
+                rendered_rows = (
+                    vl.get("data", {}).get("values")
+                    if isinstance(vl, dict) and isinstance(vl.get("data"), dict)
+                    else None
+                ) or cleaned_rows
                 vl = apply_augmentation_to_spec(
                     vl,
-                    cleaned_rows,
+                    rendered_rows,
                     aug,
                     tone=bg_tone,
                     palette=palette,
@@ -431,34 +487,59 @@ async def import_pptx(
         ) from e
 
 
-@router.post("/outline", response_model=OutlineResponse)
+@router.post(
+    "/outline",
+    response_model=DeckJobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
 def post_deck_outline(
     body: OutlineRequest,
     _user_id: Annotated[str, Depends(get_user_id)],
     svc: Annotated[DeckService, Depends(get_deck_service)],
     client: Annotated[Any, Depends(get_user_workspace_client)],
-) -> OutlineResponse:
+) -> DeckJobResponse:
     template = templates_service.get(body.template_id)
     if template is None:
         raise HTTPException(status_code=404, detail="Template not found")
-    tokens = _tokens_dict_from_template(template)
-    theme_markdown = template.theme_markdown or ""
-    widgets, rows_by_widget, genie_warnings = _widgets_from_genie(
-        client, body.genie_space_id, body.questions
+    job = deck_job_store.create(now=_time.time(), kind="outline")
+    future = _deck_job_executor.submit(
+        _run_outline_generation_job,
+        job.id,
+        svc=svc,
+        client=client,
+        body=body,
+        template=template,
     )
-    for errmsg in genie_warnings:
-        print(
-            f"[outline] genie question failed: {errmsg}",
-            file=sys.stderr,
-            flush=True,
-        )
-    for w in widgets:
-        rows = rows_by_widget.get(w.widget_id, [])
-        summary = summarize_widget_rows(rows)
-        if summary:
-            w.query_result_summary = summary
-            w.row_count = len(rows)
+    deck_job_store.attach_future(job.id, future)
+    return DeckJobResponse(job_id=job.id, status="running")
+
+
+def _run_outline_generation_job(
+    job_id: str,
+    *,
+    svc: DeckService,
+    client: Any,
+    body: OutlineRequest,
+    template: Template,
+) -> None:
     try:
+        tokens = _tokens_dict_from_template(template)
+        theme_markdown = template.theme_markdown or ""
+        widgets, rows_by_widget, genie_warnings = _widgets_from_genie(
+            client, body.genie_space_id, body.questions
+        )
+        for errmsg in genie_warnings:
+            print(
+                f"[outline] genie question failed: {errmsg}",
+                file=sys.stderr,
+                flush=True,
+            )
+        for w in widgets:
+            rows = rows_by_widget.get(w.widget_id, [])
+            summary = summarize_widget_rows(rows)
+            if summary:
+                w.query_result_summary = summary
+                w.row_count = len(rows)
         slides = svc.generate_outline(
             tokens=tokens,
             theme_markdown=theme_markdown,
@@ -467,14 +548,16 @@ def post_deck_outline(
             reference_doc=body.reference_doc,
             reference_doc_name=body.reference_doc_name,
         )
+        deck_job_store.set_done(job_id, result=slides)
+    except HTTPException as e:
+        deck_job_store.set_error(job_id, str(e.detail), e.status_code)
     except DeckValidationError as e:
-        raise _http_from_validation(e) from e
+        h = _http_from_validation(e)
+        deck_job_store.set_error(job_id, str(h.detail), h.status_code)
     except RuntimeError as e:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=str(e),
-        ) from e
-    return OutlineResponse(slides=[OutlineSlide(**s) for s in slides])
+        deck_job_store.set_error(job_id, str(e), 503)
+    except Exception as e:
+        deck_job_store.set_error(job_id, str(e), 500)
 
 
 _ALLOWED_REF_DOC_SUFFIXES = (".txt", ".md", ".markdown")
@@ -529,53 +612,38 @@ def audit_deck(
     return AuditResponse(deck=deck, issues=[AuditIssue(**i) for i in issues])
 
 
-@router.get("/{deck_id}", response_model=Deck)
-def get_deck(
-    deck_id: str,
-    user_id: Annotated[str, Depends(get_user_id)],
-    svc: Annotated[DeckService, Depends(get_deck_service)],
-) -> Deck:
-    deck = svc.get_deck(deck_id, user_id)
-    if deck is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
-    return deck
-
-
-@router.post("", response_model=Deck, status_code=status.HTTP_201_CREATED)
-def create_deck(
+def _run_deck_generation_job(
+    job_id: str,
+    *,
+    svc: DeckService,
+    client: Any,
     body: GenerationRequest,
-    user_id: Annotated[str, Depends(get_user_id)],
-    svc: Annotated[DeckService, Depends(get_deck_service)],
-    client: Annotated[Any, Depends(get_user_workspace_client)],
-) -> Deck:
-    template = templates_service.get(body.template_id)
-    if template is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Template not found"
-        )
-    tokens = _tokens_dict_from_template(template)
-    theme_markdown = template.theme_markdown or ""
-    widgets, rows_by_widget, genie_warnings = _widgets_from_genie(
-        client, body.genie_space_id, body.questions
-    )
-    resolved_preset_id = template.preset_id or _resolve_preset_id_from_template_name(
-        template.name
-    )
-    brand_palette = CATEGORY_PALETTE_BY_PRESET.get(resolved_preset_id)
-    outline_dicts: list[dict] | None = None
-    if body.outline:
-        outline_dicts = [s.model_dump() for s in body.outline]
-    widget_charts, chart_errors = _prerender_widget_chart_data_uris(
-        widgets,
-        rows_by_widget,
-        bg_tone=_bg_tone_for_preset(resolved_preset_id),
-        palette=brand_palette,
-        outline=outline_dicts,
-        tokens=tokens,
-    )
-    chart_warnings = [f"{wid}: {msg}" for wid, msg in sorted(chart_errors.items())]
-    chart_warnings.extend(genie_warnings)
+    user_id: str,
+    template: Template,
+) -> None:
     try:
+        tokens = _tokens_dict_from_template(template)
+        theme_markdown = template.theme_markdown or ""
+        widgets, rows_by_widget, genie_warnings = _widgets_from_genie(
+            client, body.genie_space_id, body.questions
+        )
+        resolved_preset_id = (
+            template.preset_id or _resolve_preset_id_from_template_name(template.name)
+        )
+        brand_palette = CATEGORY_PALETTE_BY_PRESET.get(resolved_preset_id)
+        outline_dicts: list[dict] | None = None
+        if body.outline:
+            outline_dicts = [s.model_dump() for s in body.outline]
+        widget_charts, chart_errors = _prerender_widget_chart_data_uris(
+            widgets,
+            rows_by_widget,
+            bg_tone=_bg_tone_for_preset(resolved_preset_id),
+            palette=brand_palette,
+            outline=outline_dicts,
+            tokens=tokens,
+        )
+        chart_warnings = [f"{wid}: {msg}" for wid, msg in sorted(chart_errors.items())]
+        chart_warnings.extend(genie_warnings)
         deck = svc.generate_deck(
             user_id=user_id,
             template_id=body.template_id,
@@ -599,14 +667,113 @@ def create_deck(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail=f"High-quality audit failed: {exc}",
                 ) from exc
-        return deck
+        deck_job_store.set_done(job_id, deck.id)
+    except HTTPException as e:
+        deck_job_store.set_error(job_id, str(e.detail), e.status_code)
     except DeckValidationError as e:
-        raise _http_from_validation(e) from e
+        h = _http_from_validation(e)
+        deck_job_store.set_error(job_id, str(h.detail), h.status_code)
     except RuntimeError as e:
+        deck_job_store.set_error(job_id, str(e), 503)
+    except Exception as e:
+        deck_job_store.set_error(job_id, str(e), 500)
+
+
+@router.get("/jobs/{job_id}", response_model=DeckJobResponse)
+def get_deck_job(job_id: str) -> DeckJobResponse:
+    job = deck_job_store.get(job_id)
+    if job is None or job.kind != "deck":
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=str(e),
-        ) from e
+            status_code=status.HTTP_404_NOT_FOUND, detail="Job not found"
+        )
+    return DeckJobResponse(
+        job_id=job.id,
+        status=job.status,
+        deck_id=job.deck_id,
+        error=job.error,
+        status_code=job.status_code,
+    )
+
+
+@router.get("/outline/jobs/{job_id}", response_model=OutlineJobResponse)
+def get_outline_job(job_id: str) -> OutlineJobResponse:
+    job = deck_job_store.get(job_id)
+    if job is None or job.kind != "outline":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Job not found"
+        )
+    if job.status == "done":
+        result = job.result
+        if not isinstance(result, list):
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="outline result invalid",
+            )
+        slides: list[OutlineSlide] = []
+        try:
+            for s in result:
+                slides.append(OutlineSlide(**s))
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="outline result invalid",
+            ) from e
+        return OutlineJobResponse(
+            job_id=job.id,
+            status=job.status,
+            slides=slides,
+            error=job.error,
+            status_code=job.status_code,
+        )
+    return OutlineJobResponse(
+        job_id=job.id,
+        status=job.status,
+        slides=None,
+        error=job.error,
+        status_code=job.status_code,
+    )
+
+
+@router.get("/{deck_id}", response_model=Deck)
+def get_deck(
+    deck_id: str,
+    user_id: Annotated[str, Depends(get_user_id)],
+    svc: Annotated[DeckService, Depends(get_deck_service)],
+) -> Deck:
+    deck = svc.get_deck(deck_id, user_id)
+    if deck is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    return deck
+
+
+@router.post(
+    "",
+    response_model=DeckJobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def create_deck(
+    body: GenerationRequest,
+    user_id: Annotated[str, Depends(get_user_id)],
+    svc: Annotated[DeckService, Depends(get_deck_service)],
+    client: Annotated[Any, Depends(get_user_workspace_client)],
+) -> DeckJobResponse:
+    template = templates_service.get(body.template_id)
+    if template is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Template not found"
+        )
+    job = deck_job_store.create(now=_time.time())
+    future = _deck_job_executor.submit(
+        _run_deck_generation_job,
+        job.id,
+        svc=svc,
+        client=client,
+        body=body,
+        user_id=user_id,
+        template=template,
+    )
+    deck_job_store.attach_future(job.id, future)
+    return DeckJobResponse(job_id=job.id, status="running")
 
 
 @router.get("/{deck_id}/comments", response_model=list[PendingComment])

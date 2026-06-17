@@ -9,7 +9,7 @@ from typing import Any
 
 import httpx
 
-from models import ChartAugmentation, TemplateGuidelines, WidgetInfo
+from models import ChartAugmentation, ChartDesign, TemplateGuidelines, WidgetInfo
 
 SLIDE_AUTHORING_RULES = """
 ## Open-slide slide authoring rules
@@ -1115,6 +1115,57 @@ class LLMService:
             raise ValueError("LLM response is not a JSON array")
         return parsed
 
+    @staticmethod
+    def _design_uses_available_fields(
+        design: ChartDesign, available_fields: list[str]
+    ) -> bool:
+        allowed = set(available_fields)
+        for field_name in (
+            design.category_field,
+            design.value_field,
+            design.series_field,
+        ):
+            if field_name is not None and field_name not in allowed:
+                return False
+        return True
+
+    @staticmethod
+    def _clamp_design_top_n(raw_design: dict[str, Any]) -> dict[str, Any]:
+        design_dict = dict(raw_design)
+        top_n = design_dict.get("top_n")
+        if top_n is None:
+            return design_dict
+        try:
+            top_n_int = int(top_n)
+        except (TypeError, ValueError):
+            design_dict.pop("top_n", None)
+            return design_dict
+        if top_n_int < 1:
+            design_dict.pop("top_n", None)
+        elif top_n_int > 20:
+            design_dict["top_n"] = 20
+        else:
+            design_dict["top_n"] = top_n_int
+        return design_dict
+
+    def _parse_chart_design_from_raw(
+        self,
+        raw_design: Any,
+        available_fields: list[str],
+    ) -> ChartDesign | None:
+        from pydantic import ValidationError
+
+        if not isinstance(raw_design, dict):
+            return None
+        try:
+            clamped = self._clamp_design_top_n(raw_design)
+            design = ChartDesign.model_validate(clamped)
+            if not self._design_uses_available_fields(design, available_fields):
+                return None
+            return design
+        except ValidationError:
+            return None
+
     def augment_chart_specs_for_deck(
         self,
         *,
@@ -1138,7 +1189,21 @@ class LLMService:
             "You are a presentation designer improving dashboard charts for slide decks.\n"
             "Each widget includes `available_fields` (the exact column keys in `rows_sample`).\n"
             "\n"
-            "## What to emit per widget\n"
+            "## Step 1 — Design the chart (analytical intent)\n"
+            "FIRST choose a `design` object from the question's intent, then add decoration.\n"
+            "Set `design` to null when the heuristic chart is fine and you only need decoration.\n"
+            "\n"
+            "Intent → design rules:\n"
+            '- Ranking / top / most / least → chart_type "bar", sort "value_desc", '
+            'set top_n (8–15). Prefer orientation "horizontal" when category labels are '
+            "long text (emails, names, event types).\n"
+            '- Trend over time → chart_type "line" (do NOT set top_n or sort).\n'
+            '- Part-of-whole / share → chart_type "pie" sparingly (≤ 6 slices).\n'
+            '- Correlation → chart_type "scatter".\n'
+            "- category_field, value_field, and series_field MUST each be one of "
+            "`available_fields` when set.\n"
+            "\n"
+            "## Step 2 — Decoration (optional story layer)\n"
             "Pick AT MOST ONE concise story when the data clearly supports it; otherwise leave\n"
             "every optional field null / empty (a plain chart is better than a wrong story).\n"
             "\n"
@@ -1147,6 +1212,8 @@ class LLMService:
             "If you cannot identify which field to highlight, set `highlight` to null.\n"
             "- `highlight.values` MUST be drawn from values actually present in `rows_sample` "
             "for that field (copy them verbatim — do not paraphrase or translate).\n"
+            "- When you set design.top_n, every `highlight.values` entry MUST be a category "
+            "that survives the designed top_n ranking (do not highlight a category top_n drops).\n"
             "- `reference_line.value` must fall within the data extent of that axis.\n"
             "- `y_range` only when zooming in genuinely clarifies the story; range must lie "
             "inside the data extent.\n"
@@ -1160,6 +1227,12 @@ class LLMService:
             "## Output\n"
             "STRICT JSON only — no markdown fences, no commentary, no trailing text.\n"
             'Schema: {"augmentations":[{"widget_id":"...", '
+            '"design":{"chart_type":"bar"|"line"|"area"|"pie"|"scatter"|null,'
+            '"category_field":"..."|null,"value_field":"..."|null,'
+            '"series_field":"..."|null,'
+            '"aggregate":"sum"|"avg"|"count"|"none",'
+            '"sort":"value_desc"|"value_asc"|"category"|"none",'
+            '"top_n":int|null,"orientation":"horizontal"|"vertical"|null}|null, '
             '"highlight":{"field":"...","values":["..."]}|null, '
             '"y_range":[min,max]|null, '
             '"reference_line":{"axis":"y"|"x","value":number,"label":"..."}|null, '
@@ -1175,12 +1248,16 @@ class LLMService:
             '{"age_band":"50代","avg_spend":3100},{"age_band":"60代以上","avg_spend":2200}]}\n'
             "Good output:\n"
             '  {"widget_id":"w1",'
+            '"design":{"chart_type":"bar","category_field":"age_band",'
+            '"value_field":"avg_spend","series_field":null,'
+            '"aggregate":"none","sort":"value_desc","top_n":5,'
+            '"orientation":"horizontal"},'
             '"highlight":{"field":"age_band","values":["50代"]},'
             '"y_range":null,'
             '"reference_line":{"axis":"y","value":2160,"label":"平均"},'
             '"value_format":"currency","caption":"50代が突出して高単価"}\n'
-            'Note: `highlight.field` is "age_band" (an available_field, not '
-            '"age_group"); the highlighted value is "50代" copied verbatim from rows_sample.'
+            'Note: `highlight.field` is "age_band" (an available_field); the highlighted value '
+            'is "50代" copied verbatim from rows_sample and kept within top_n categories.'
         )
 
         payload = json.dumps(
@@ -1230,13 +1307,25 @@ class LLMService:
         if not isinstance(raw_items, list):
             return []
 
+        fields_by_widget: dict[str, list[str]] = {}
+        for widget in widgets_with_data or []:
+            if not isinstance(widget, dict):
+                continue
+            widget_id = widget.get("widget_id")
+            available_fields = widget.get("available_fields")
+            if isinstance(widget_id, str) and isinstance(available_fields, list):
+                fields_by_widget[widget_id] = [
+                    field for field in available_fields if isinstance(field, str)
+                ]
+
         results: list[ChartAugmentation] = []
         for raw_entry in raw_items:
             if not isinstance(raw_entry, dict):
                 continue
             entry = dict(raw_entry)
+            raw_design = entry.pop("design", None)
             try:
-                results.append(ChartAugmentation.model_validate(entry))
+                aug = ChartAugmentation.model_validate(entry)
             except ValidationError as exc:
                 print(
                     f"[chart-augment] widget validation skipped: {exc}",
@@ -1244,4 +1333,7 @@ class LLMService:
                     flush=True,
                 )
                 continue
+            available_fields = fields_by_widget.get(aug.widget_id, [])
+            design = self._parse_chart_design_from_raw(raw_design, available_fields)
+            results.append(aug.model_copy(update={"design": design}))
         return results

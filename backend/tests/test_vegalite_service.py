@@ -6,10 +6,12 @@ import json
 
 from models import (
     ChartAugmentation,
+    ChartDesign,
     ChartHighlight,
     ChartReferenceLine,
 )
 from services.vegalite_service import (
+    _aggregate_sort_top_n_rows,
     _chart_base,
     _encoding_field,
     _filter_nulls_for_chart,
@@ -21,6 +23,13 @@ from services.vegalite_service import (
     infer_vega_type,
     widget_spec_from_columns,
 )
+
+
+def _bar_enc(vl: dict) -> dict:
+    """Encoding for the primary bar layer (layered bar specs)."""
+    if "layer" in vl:
+        return vl["layer"][0]["encoding"]
+    return vl["encoding"]
 
 
 def test_chart_base_default_width_is_pixels() -> None:
@@ -54,9 +63,10 @@ def test_convert_bar() -> None:
     data = [{"month": "Jan", "revenue": 10}, {"month": "Feb", "revenue": 20}]
     vl = convert_widget_to_vegalite(spec, data)
     assert vl is not None
-    assert vl["mark"]["type"] == "bar"
-    assert vl["encoding"]["x"]["field"] == "month"
-    assert vl["encoding"]["y"]["field"] == "revenue"
+    assert vl["layer"][0]["mark"]["type"] == "bar"
+    enc = _bar_enc(vl)
+    assert enc["x"]["field"] == "month"
+    assert enc["y"]["field"] == "revenue"
     assert vl["title"] == "Rev"
 
 
@@ -112,7 +122,31 @@ def test_vega_lite_config_quantitative_axis_format_si() -> None:
     fmt = cfg.get("axisQuantitative", {}).get("format")
     if fmt is None:
         fmt = cfg.get("axis", {}).get("format")
-    assert fmt is not None and "~s" in str(fmt)
+    assert fmt == ".2s"
+
+
+def test_vega_lite_config_default_axis_editorial_style() -> None:
+    cfg = _vega_lite_config("light")
+    axis = cfg["axis"]
+    assert axis["domain"] is False
+    assert axis["ticks"] is False
+    assert axis["grid"] is False
+    assert axis["labelFontWeight"] == 500
+
+
+def test_vega_lite_config_axis_quantitative_editorial_style() -> None:
+    cfg = _vega_lite_config("light")
+    aq = cfg["axisQuantitative"]
+    assert aq["format"] == ".2s"
+    assert aq["grid"] is True
+    assert aq["gridColor"] == "rgba(15,15,15,0.10)"
+    assert aq["domain"] is False
+    assert aq["ticks"] is False
+
+
+def test_vega_lite_config_legend_label_font_weight_matches_axis() -> None:
+    cfg = _vega_lite_config("light")
+    assert cfg["legend"]["labelFontWeight"] == 500
 
 
 def test_vega_lite_config_axis_tick_density() -> None:
@@ -230,8 +264,9 @@ def test_convert_strips_japanese_axis_title_x_emits_null() -> None:
     data = [{"age_band": "20代", "revenue": 10}]
     vl = convert_widget_to_vegalite(spec, data)
     assert vl is not None
-    assert "title" in vl["encoding"]["x"]
-    assert vl["encoding"]["x"]["title"] is None
+    enc = _bar_enc(vl)
+    assert "title" in enc["x"]
+    assert enc["x"]["title"] is None
 
 
 def test_convert_strips_japanese_axis_title_y_emits_null() -> None:
@@ -245,8 +280,9 @@ def test_convert_strips_japanese_axis_title_y_emits_null() -> None:
     data = [{"month": "Jan", "avg_pay": 100}]
     vl = convert_widget_to_vegalite(spec, data)
     assert vl is not None
-    assert "title" in vl["encoding"]["y"]
-    assert vl["encoding"]["y"]["title"] is None
+    enc = _bar_enc(vl)
+    assert "title" in enc["y"]
+    assert enc["y"]["title"] is None
 
 
 def test_convert_strips_japanese_color_legend_title_emits_null() -> None:
@@ -264,7 +300,7 @@ def test_convert_strips_japanese_color_legend_title_emits_null() -> None:
     ]
     vl = convert_widget_to_vegalite(spec, data)
     assert vl is not None
-    enc_color = vl["encoding"]["color"]
+    enc_color = _bar_enc(vl)["color"]
     assert "title" in enc_color
     assert enc_color["title"] is None
     assert "legend" in enc_color
@@ -297,8 +333,9 @@ def test_convert_preserves_ascii_axis_titles() -> None:
     data = [{"m": "Jan", "s": 1}]
     vl = convert_widget_to_vegalite(spec, data)
     assert vl is not None
-    assert vl["encoding"]["x"]["title"] == "Month"
-    assert vl["encoding"]["y"]["title"] == "Sales"
+    enc = _bar_enc(vl)
+    assert enc["x"]["title"] == "Month"
+    assert enc["y"]["title"] == "Sales"
 
 
 def test_encoding_field_suppress_title_emits_explicit_null() -> None:
@@ -486,9 +523,10 @@ def test_widget_spec_then_convert_renders() -> None:
     vl = convert_widget_to_vegalite(spec, rows)
     assert vl is not None
     assert isinstance(vl, dict)
-    assert vl["mark"]["type"] == "bar"
-    assert vl["encoding"]["x"]["field"] == "region"
-    assert vl["encoding"]["y"]["field"] == "amount"
+    enc = _bar_enc(vl)
+    assert vl["layer"][0]["mark"]["type"] == "bar"
+    assert enc["x"]["field"] == "region"
+    assert enc["y"]["field"] == "amount"
 
 
 def test_apply_augmentation_idempotent() -> None:
@@ -507,3 +545,417 @@ def test_apply_augmentation_idempotent() -> None:
     once = apply_augmentation_to_spec(vl, rows, aug)
     twice = apply_augmentation_to_spec(once, rows, aug)
     assert json.dumps(once, sort_keys=True) == json.dumps(twice, sort_keys=True)
+
+
+# --- ChartDesign (C1) ---
+
+
+def _many_category_rows(n: int = 10) -> list[dict[str, float | str]]:
+    return [{"category": f"C{i}", "value": float(i + 1)} for i in range(n)]
+
+
+def test_design_top_n_limits_x_categories() -> None:
+    rows = _many_category_rows(10)
+    spec = widget_spec_from_columns("Rank", ["category", "value"], rows)
+    design = ChartDesign(
+        chart_type="bar",
+        category_field="category",
+        value_field="value",
+        aggregate="sum",
+        sort="value_desc",
+        top_n=3,
+    )
+    vl = convert_widget_to_vegalite(spec, rows, design=design)
+    assert vl is not None
+    enc = _bar_enc(vl)
+    cats = {r["category"] for r in vl["data"]["values"]}
+    assert len(cats) <= 3
+    assert enc["x"]["field"] == "category"
+
+
+def test_design_value_desc_sets_explicit_sort_domain() -> None:
+    rows = [
+        {"category": "A", "value": 10.0},
+        {"category": "B", "value": 30.0},
+        {"category": "C", "value": 20.0},
+    ]
+    spec = widget_spec_from_columns("Rank", ["category", "value"], rows)
+    design = ChartDesign(
+        chart_type="bar",
+        category_field="category",
+        value_field="value",
+        aggregate="sum",
+        sort="value_desc",
+    )
+    vl = convert_widget_to_vegalite(spec, rows, design=design)
+    assert vl is not None
+    assert _bar_enc(vl)["x"]["sort"] == ["B", "C", "A"]
+
+
+def test_design_aggregated_rows_in_data_values() -> None:
+    rows = [
+        {"category": "A", "value": 1.0},
+        {"category": "A", "value": 2.0},
+        {"category": "B", "value": 5.0},
+    ]
+    spec = widget_spec_from_columns("Sum", ["category", "value"], rows)
+    design = ChartDesign(
+        chart_type="bar",
+        category_field="category",
+        value_field="value",
+        aggregate="sum",
+        sort="value_desc",
+    )
+    vl = convert_widget_to_vegalite(spec, rows, design=design)
+    assert vl is not None
+    by_cat = {r["category"]: r["value"] for r in vl["data"]["values"]}
+    assert by_cat["A"] == 3.0
+    assert by_cat["B"] == 5.0
+    assert "aggregate" not in _bar_enc(vl)["y"]
+
+
+def test_design_aggregate_count_without_value_field() -> None:
+    rows = [
+        {"category": "A"},
+        {"category": "A"},
+        {"category": "B"},
+    ]
+    spec = widget_spec_from_columns("Count", ["category"], rows)
+    design = ChartDesign(
+        chart_type="bar",
+        category_field="category",
+        value_field=None,
+        aggregate="count",
+        sort="value_desc",
+    )
+    vl = convert_widget_to_vegalite(spec, rows, design=design)
+    assert vl is not None
+    by_cat = {r["category"]: r["__count"] for r in vl["data"]["values"]}
+    assert by_cat["A"] == 2
+    assert by_cat["B"] == 1
+
+
+def test_design_horizontal_orientation_measure_on_x() -> None:
+    rows = [{"category": "A", "value": 10.0}, {"category": "B", "value": 20.0}]
+    spec = widget_spec_from_columns("H", ["category", "value"], rows)
+    design = ChartDesign(
+        chart_type="bar",
+        category_field="category",
+        value_field="value",
+        aggregate="sum",
+        orientation="horizontal",
+    )
+    vl = convert_widget_to_vegalite(spec, rows, design=design)
+    assert vl is not None
+    enc = _bar_enc(vl)
+    assert enc["x"]["type"] == "quantitative"
+    assert enc["y"]["type"] == "nominal"
+    assert enc["x"]["field"] == "value"
+    assert enc["y"]["field"] == "category"
+
+
+def test_design_horizontal_reference_line_on_x() -> None:
+    rows = [{"category": "A", "value": 10.0}, {"category": "B", "value": 90.0}]
+    spec = widget_spec_from_columns("H", ["category", "value"], rows)
+    design = ChartDesign(
+        chart_type="bar",
+        category_field="category",
+        value_field="value",
+        aggregate="sum",
+        orientation="horizontal",
+    )
+    vl = convert_widget_to_vegalite(spec, rows, design=design)
+    assert vl is not None
+    aug = ChartAugmentation(
+        widget_id="w",
+        reference_line=ChartReferenceLine(axis="y", value=50, label="Target"),
+    )
+    out = apply_augmentation_to_spec(vl, vl["data"]["values"], aug)
+    rules = [
+        layer for layer in out["layer"] if layer.get("mark", {}).get("type") == "rule"
+    ]
+    assert rules
+    assert "x" in rules[0]["encoding"]
+
+
+def test_filter_nulls_design_aware() -> None:
+    spec = {
+        "widgetType": "bar",
+        "encodings": {"x": {"fieldName": "a"}, "y": {"fieldName": "b"}},
+    }
+    design = ChartDesign(
+        chart_type="bar",
+        category_field="cat",
+        value_field="val",
+        series_field="seg",
+    )
+    rows = [
+        {"a": "x", "b": 1, "cat": "ok", "val": 5, "seg": None},
+        {"a": "y", "b": 2, "cat": "ok", "val": 6, "seg": "red"},
+    ]
+    cleaned, n_dropped = _filter_nulls_for_chart(spec, rows, design=design)
+    assert n_dropped == 1
+    assert cleaned == [rows[1]]
+
+
+def test_design_accent_color_single_series_bar() -> None:
+    rows = [{"category": "A", "value": 10.0}, {"category": "B", "value": 20.0}]
+    spec = widget_spec_from_columns("Accent", ["category", "value"], rows)
+    design = ChartDesign(
+        chart_type="bar",
+        category_field="category",
+        value_field="value",
+        aggregate="sum",
+    )
+    accent = "#FF5500"
+    vl = convert_widget_to_vegalite(spec, rows, design=design, accent_color=accent)
+    assert vl is not None
+    assert _bar_enc(vl)["color"]["value"] == accent
+
+
+def test_design_none_matches_heuristic_output() -> None:
+    rows = [
+        {"region": "North", "amount": 50},
+        {"region": "South", "amount": 70},
+    ]
+    spec = widget_spec_from_columns("Amounts", ["region", "amount"], rows)
+    baseline = convert_widget_to_vegalite(spec, rows)
+    with_none = convert_widget_to_vegalite(spec, rows, design=None)
+    assert json.dumps(baseline, sort_keys=True) == json.dumps(with_none, sort_keys=True)
+
+
+def test_design_line_temporal_skips_top_n_and_preserves_order() -> None:
+    rows = [
+        {"month": "2024-01-01", "revenue": 100.0},
+        {"month": "2024-02-01", "revenue": 50.0},
+        {"month": "2024-03-01", "revenue": 200.0},
+        {"month": "2024-04-01", "revenue": 75.0},
+        {"month": "2024-05-01", "revenue": 120.0},
+    ]
+    spec = widget_spec_from_columns("Trend", ["month", "revenue"], rows)
+    design = ChartDesign(
+        chart_type="line",
+        category_field="month",
+        value_field="revenue",
+        aggregate="sum",
+        sort="value_desc",
+        top_n=3,
+    )
+    vl = convert_widget_to_vegalite(spec, rows, design=design)
+    assert vl is not None
+    months = [r["month"] for r in vl["data"]["values"]]
+    assert months == [r["month"] for r in rows]
+    assert "sort" not in vl["encoding"]["x"]
+
+
+def test_aggregate_sort_top_n_rows_unit() -> None:
+    rows = [
+        {"category": "A", "value": 1.0},
+        {"category": "B", "value": 5.0},
+        {"category": "C", "value": 3.0},
+    ]
+    rendered, ordered = _aggregate_sort_top_n_rows(
+        rows, "category", "value", None, "sum", "value_desc", 2
+    )
+    assert ordered == ["B", "C"]
+    assert len({r["category"] for r in rendered}) == 2
+
+
+# --- S2: bar value labels ---
+
+
+def _value_label_layers(vl: dict) -> list[dict]:
+    return [
+        layer
+        for layer in vl.get("layer", [])
+        if layer.get("mark", {}).get("type") == "text"
+        and layer.get("encoding", {}).get("text", {}).get("format") == ".2s"
+    ]
+
+
+def test_bar_design_horizontal_has_value_label_layer() -> None:
+    rows = [{"category": "A", "value": 10.0}, {"category": "B", "value": 90.0}]
+    spec = widget_spec_from_columns("H", ["category", "value"], rows)
+    design = ChartDesign(
+        chart_type="bar",
+        category_field="category",
+        value_field="value",
+        aggregate="sum",
+        orientation="horizontal",
+    )
+    vl = convert_widget_to_vegalite(spec, rows, design=design)
+    assert vl is not None
+    assert "layer" in vl
+    assert vl["layer"][0]["mark"]["type"] == "bar"
+    text_layers = _value_label_layers(vl)
+    assert len(text_layers) == 1
+    assert "color" not in text_layers[0]["encoding"]
+    assert text_layers[0]["encoding"]["text"]["format"] == ".2s"
+    measure_enc = vl["layer"][0]["encoding"]["x"]
+    assert measure_enc.get("axis") is None
+    assert measure_enc["scale"]["domainMax"] == 90.0 * 1.18
+
+
+def test_bar_vertical_text_positioning() -> None:
+    rows = [{"category": "A", "value": 10.0}, {"category": "B", "value": 20.0}]
+    spec = widget_spec_from_columns("V", ["category", "value"], rows)
+    design = ChartDesign(
+        chart_type="bar",
+        category_field="category",
+        value_field="value",
+        aggregate="sum",
+    )
+    vl = convert_widget_to_vegalite(spec, rows, design=design)
+    assert vl is not None
+    text_mark = _value_label_layers(vl)[0]["mark"]
+    assert text_mark["align"] == "center"
+    assert text_mark["baseline"] == "bottom"
+    assert text_mark["dy"] == -8
+    assert "dx" not in text_mark
+
+
+def test_bar_horizontal_text_positioning() -> None:
+    rows = [{"category": "A", "value": 10.0}, {"category": "B", "value": 20.0}]
+    spec = widget_spec_from_columns("H", ["category", "value"], rows)
+    design = ChartDesign(
+        chart_type="bar",
+        category_field="category",
+        value_field="value",
+        aggregate="sum",
+        orientation="horizontal",
+    )
+    vl = convert_widget_to_vegalite(spec, rows, design=design)
+    assert vl is not None
+    text_mark = _value_label_layers(vl)[0]["mark"]
+    assert text_mark["align"] == "left"
+    assert text_mark["baseline"] == "middle"
+    assert text_mark["dx"] == 8
+    assert "dy" not in text_mark
+
+
+def test_heuristic_bar_aggregate_matches_text_and_domain_max() -> None:
+    spec = {
+        "widgetType": "bar",
+        "encodings": {
+            "x": {"fieldName": "category"},
+            "y": {"fieldName": "sum(revenue)"},
+        },
+    }
+    rows = [
+        {"category": "A", "revenue": 40},
+        {"category": "A", "revenue": 40},
+        {"category": "B", "revenue": 30},
+    ]
+    vl = convert_widget_to_vegalite(spec, rows)
+    assert vl is not None
+    text_layers = _value_label_layers(vl)
+    assert len(text_layers) == 1
+    assert text_layers[0]["encoding"]["text"]["aggregate"] == "sum"
+    measure_enc = vl["layer"][0]["encoding"]["y"]
+    assert measure_enc["scale"]["domainMax"] == 80.0 * 1.18
+
+
+def test_highlight_recolors_bar_layer_preserves_text() -> None:
+    rows = [{"category": "A", "value": 10.0}, {"category": "B", "value": 90.0}]
+    spec = widget_spec_from_columns("H", ["category", "value"], rows)
+    design = ChartDesign(
+        chart_type="bar",
+        category_field="category",
+        value_field="value",
+        aggregate="sum",
+        orientation="horizontal",
+    )
+    vl = convert_widget_to_vegalite(spec, rows, design=design)
+    assert vl is not None
+    aug = ChartAugmentation(
+        widget_id="w",
+        highlight=ChartHighlight(field="category", values=["B"]),
+    )
+    out = apply_augmentation_to_spec(vl, vl["data"]["values"], aug)
+    color = out["layer"][0]["encoding"]["color"]
+    assert "condition" in color or "scale" in color
+    text_layers = _value_label_layers(out)
+    assert len(text_layers) == 1
+    assert "color" not in text_layers[0]["encoding"]
+
+
+def test_reference_line_coexists_with_value_labels() -> None:
+    rows = [{"category": "A", "value": 10.0}, {"category": "B", "value": 90.0}]
+    spec = widget_spec_from_columns("H", ["category", "value"], rows)
+    design = ChartDesign(
+        chart_type="bar",
+        category_field="category",
+        value_field="value",
+        aggregate="sum",
+        orientation="horizontal",
+    )
+    vl = convert_widget_to_vegalite(spec, rows, design=design)
+    assert vl is not None
+    aug = ChartAugmentation(
+        widget_id="w",
+        reference_line=ChartReferenceLine(axis="y", value=50, label="Target"),
+    )
+    out = apply_augmentation_to_spec(vl, vl["data"]["values"], aug)
+    assert out["layer"][0]["mark"]["type"] == "bar"
+    assert len(_value_label_layers(out)) == 1
+    rules = [
+        layer for layer in out["layer"] if layer.get("mark", {}).get("type") == "rule"
+    ]
+    assert rules
+
+
+def test_non_bar_charts_have_no_value_label_layer() -> None:
+    line_rows = [
+        {"month": "2024-01-01", "revenue": 100.0},
+        {"month": "2024-02-01", "revenue": 150.0},
+    ]
+    line_spec = widget_spec_from_columns("Trend", ["month", "revenue"], line_rows)
+    line_design = ChartDesign(
+        chart_type="line",
+        category_field="month",
+        value_field="revenue",
+        aggregate="sum",
+    )
+    line_vl = convert_widget_to_vegalite(line_spec, line_rows, design=line_design)
+    assert line_vl is not None
+    assert "layer" not in line_vl
+    assert line_vl["mark"]["type"] == "line"
+
+    area_design = ChartDesign(
+        chart_type="area",
+        category_field="month",
+        value_field="revenue",
+        aggregate="sum",
+    )
+    area_vl = convert_widget_to_vegalite(line_spec, line_rows, design=area_design)
+    assert area_vl is not None
+    assert "layer" not in area_vl
+    assert area_vl["mark"]["type"] == "area"
+
+    scatter_rows = [{"x": 1.0, "y": 2.0}, {"x": 3.0, "y": 4.0}]
+    scatter_spec = widget_spec_from_columns("S", ["x", "y"], scatter_rows)
+    scatter_design = ChartDesign(
+        chart_type="scatter",
+        category_field="x",
+        value_field="y",
+        aggregate="sum",
+    )
+    scatter_vl = convert_widget_to_vegalite(
+        scatter_spec, scatter_rows, design=scatter_design
+    )
+    assert scatter_vl is not None
+    assert "layer" not in scatter_vl
+    assert scatter_vl["mark"]["type"] == "point"
+
+    pie_rows = [{"region": "A", "rev": 100}, {"region": "B", "rev": 200}]
+    pie_spec = widget_spec_from_columns("P", ["region", "rev"], pie_rows)
+    pie_design = ChartDesign(
+        chart_type="pie",
+        category_field="region",
+        value_field="rev",
+        aggregate="sum",
+    )
+    pie_vl = convert_widget_to_vegalite(pie_spec, pie_rows, design=pie_design)
+    assert pie_vl is not None
+    assert "layer" not in pie_vl
+    assert pie_vl["mark"]["type"] == "arc"

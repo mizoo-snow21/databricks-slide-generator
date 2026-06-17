@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import copy
+import json
 import re
 from collections import defaultdict
 from collections.abc import Mapping
 from datetime import date, datetime
 from typing import Any, Literal
+
+from models import ChartAugmentation, ChartDesign
 
 
 _AGG_FN_RE = re.compile(
@@ -77,14 +80,10 @@ def _vega_lite_config(
     """
     if tone == "dark":
         text_color = "rgba(255,255,255,0.98)"
-        domain_color = "rgba(255,255,255,0.72)"
-        tick_color = "rgba(255,255,255,0.65)"
         grid_color = "rgba(255,255,255,0.12)"
         arc_stroke = "rgba(15,30,40,0.55)"  # darken between slices for depth
     else:
         text_color = "rgba(15,15,15,0.95)"
-        domain_color = "rgba(15,15,15,0.70)"
-        tick_color = "rgba(15,15,15,0.60)"
         grid_color = "rgba(15,15,15,0.10)"
         arc_stroke = "rgba(255,255,255,0.85)"  # bright stroke for slice definition
     cat_palette = palette if palette is not None else _CATEGORY_PALETTE
@@ -92,21 +91,14 @@ def _vega_lite_config(
         "background": "transparent",
         "padding": {"left": 16, "right": 16, "top": 14, "bottom": 14},
         "axis": {
-            "grid": True,
-            "gridColor": grid_color,
-            "gridDash": [2, 4],
-            "gridWidth": 1,
-            "domain": True,
-            "domainColor": domain_color,
-            "domainWidth": 1.5,
-            "tickColor": tick_color,
-            "tickWidth": 1.5,
-            "tickSize": 6,
+            "grid": False,
+            "domain": False,
+            "ticks": False,
             "labelColor": text_color,
             "titleColor": text_color,
             "labelFont": _FONT_STACK,
             "labelFontSize": 18,
-            "labelFontWeight": 700,
+            "labelFontWeight": 500,
             "labelPadding": 6,
             "labelLimit": 240,
             # Field-name-derived axis titles ("Sum of total_amount") are
@@ -127,7 +119,13 @@ def _vega_lite_config(
             "labelBaseline": "top",
         },
         "axisQuantitative": {
-            "format": "~s",
+            "format": ".2s",
+            "grid": True,
+            "gridColor": grid_color,
+            "gridDash": [2, 4],
+            "gridWidth": 1,
+            "domain": False,
+            "ticks": False,
         },
         "legend": {
             "title": None,
@@ -135,7 +133,7 @@ def _vega_lite_config(
             "titleColor": text_color,
             "labelFont": _FONT_STACK,
             "labelFontSize": 18,
-            "labelFontWeight": 700,
+            "labelFontWeight": 500,
             "titleFont": _FONT_STACK,
             "orient": "bottom",
             "direction": "horizontal",
@@ -364,6 +362,428 @@ def _maybe_roll_up_nominal_color(
     return _truncate_top_n_with_other(rows, color_field, value_field, n=n)
 
 
+def _row_measure(row: dict[str, Any], field: str | None) -> float:
+    if not field:
+        return 1.0
+    if field not in row:
+        return 0.0
+    v = row[field]
+    if _is_number(v):
+        return float(v)
+    if isinstance(v, str) and v.strip():
+        try:
+            return float(v)
+        except ValueError:
+            pass
+    return 0.0
+
+
+def _effective_sort_and_top_n(
+    design: ChartDesign,
+    category_field: str,
+    rows: list[dict[str, Any]],
+) -> tuple[str, int | None]:
+    wtype = design.chart_type or "bar"
+    sort = design.sort
+    top_n = design.top_n
+
+    if wtype in ("line", "area"):
+        top_n = None
+        if infer_vega_type(_column_values(rows, category_field)) == "temporal":
+            sort = "none"
+
+    if wtype == "bar" and top_n is not None and sort == "none":
+        sort = "value_desc"
+
+    if top_n is not None:
+        top_n = min(top_n, 20)
+
+    return sort, top_n
+
+
+def _aggregate_sort_top_n_rows(
+    rows: list[dict[str, Any]],
+    category: str,
+    value: str | None,
+    series: str | None,
+    aggregate: Literal["sum", "avg", "count", "none"],
+    sort: Literal["value_desc", "value_asc", "category", "none"],
+    top_n: int | None,
+) -> tuple[list[dict[str, Any]], list[Any]]:
+    """Aggregate, sort categories, and keep top-N. Returns (rendered_rows, ordered_categories)."""
+    if not rows or not category:
+        return [], []
+
+    measure_field = value
+    if aggregate == "count" and not measure_field:
+        measure_field = "__count"
+
+    filtered: list[dict[str, Any]] = []
+    for row in rows:
+        cat = row.get(category)
+        if cat is None or cat == "":
+            continue
+        if series:
+            ser = row.get(series)
+            if ser is None or ser == "":
+                continue
+        filtered.append(row)
+
+    if aggregate in ("sum", "avg", "count"):
+        grouped: dict[tuple[Any, Any | None], list[dict[str, Any]]] = defaultdict(list)
+        for row in filtered:
+            key = (row[category], row.get(series) if series else None)
+            grouped[key].append(row)
+
+        rendered: list[dict[str, Any]] = []
+        for (cat, ser), group_rows in grouped.items():
+            out: dict[str, Any] = {category: cat}
+            if series:
+                out[series] = ser
+            if aggregate == "count":
+                out[measure_field] = len(group_rows)
+            elif aggregate == "sum":
+                out[measure_field] = sum(_row_measure(r, value) for r in group_rows)
+            else:
+                vals = [_row_measure(r, value) for r in group_rows]
+                out[measure_field] = (sum(vals) / len(vals)) if vals else 0.0
+            rendered.append(out)
+    else:
+        rendered = [dict(r) for r in filtered]
+
+    cat_totals: dict[Any, float] = defaultdict(float)
+    for row in rendered:
+        cat = row.get(category)
+        if cat is None:
+            continue
+        cat_totals[cat] += _row_measure(row, measure_field)
+
+    seen: set[Any] = set()
+    all_cats: list[Any] = []
+    for row in rendered:
+        cat = row.get(category)
+        if cat is not None and cat not in seen:
+            seen.add(cat)
+            all_cats.append(cat)
+
+    if sort == "value_desc":
+        ordered = sorted(all_cats, key=lambda c: (cat_totals[c], str(c)), reverse=True)
+    elif sort == "value_asc":
+        ordered = sorted(all_cats, key=lambda c: (cat_totals[c], str(c)))
+    elif sort == "category":
+        ordered = sorted(all_cats, key=str)
+    else:
+        ordered = all_cats
+
+    if top_n is not None:
+        ordered = ordered[:top_n]
+        keep = set(ordered)
+        rendered = [r for r in rendered if r.get(category) in keep]
+
+    return rendered, ordered
+
+
+def _design_is_usable(design: ChartDesign | None, columns: list[str]) -> bool:
+    if design is None or not design.chart_type:
+        return False
+    if design.chart_type not in ("bar", "line", "area", "pie", "scatter"):
+        return False
+    cat = design.category_field
+    if not cat or cat not in columns:
+        return False
+    if design.series_field and design.series_field not in columns:
+        return False
+    val = design.value_field
+    if design.chart_type == "scatter":
+        return bool(val and val in columns)
+    if design.aggregate == "count":
+        return not val or val in columns
+    return bool(val and val in columns)
+
+
+def _is_value_label_layer(layer: Any) -> bool:
+    return (
+        isinstance(layer, dict)
+        and isinstance(layer.get("mark"), dict)
+        and layer["mark"].get("type") == "text"
+        and isinstance(layer.get("encoding"), dict)
+        and isinstance(layer["encoding"].get("text"), dict)
+        and layer["encoding"]["text"].get("format") == ".2s"
+    )
+
+
+def _max_aggregated_measure(
+    rows: list[dict[str, Any]],
+    cat_field: str,
+    measure_field: str,
+    aggregate: str | None,
+) -> float | None:
+    """Max per-category aggregated measure (matches bar height semantics)."""
+    if not rows:
+        return None
+    by_cat: dict[Any, list[float]] = defaultdict(list)
+    for row in rows:
+        cat = row.get(cat_field)
+        if cat is None or cat == "":
+            continue
+        by_cat[cat].append(_row_measure(row, measure_field))
+    if not by_cat:
+        return None
+
+    per_cat: list[float] = []
+    agg = (aggregate or "").lower()
+    for vals in by_cat.values():
+        if not vals:
+            continue
+        if agg in ("", "none"):
+            per_cat.append(max(vals))
+        elif agg == "sum":
+            per_cat.append(sum(vals))
+        elif agg in ("avg", "mean"):
+            per_cat.append(sum(vals) / len(vals))
+        elif agg == "count":
+            per_cat.append(float(len(vals)))
+        elif agg == "max":
+            per_cat.append(max(vals))
+        elif agg == "min":
+            per_cat.append(min(vals))
+        else:
+            per_cat.append(max(vals))
+    if not per_cat:
+        return None
+    mx = max(per_cat)
+    if mx <= 0:
+        return None
+    return mx
+
+
+def _bar_with_value_labels(
+    bar_mark: dict[str, Any],
+    enc_out: dict[str, Any],
+    *,
+    cat_channel: str,
+    rows: list[dict[str, Any]],
+    measure_field: str,
+    aggregate: str | None,
+    tone: str,
+) -> dict[str, Any]:
+    """Return a layered spec: bar (layer 0) + value labels (layer 1)."""
+    measure_channel = "y" if cat_channel == "x" else "x"
+    text_color = _vega_lite_config(tone)["text"]["color"]
+
+    bar_enc = copy.deepcopy(enc_out)
+    text_enc = copy.deepcopy(enc_out)
+
+    cat_part = enc_out.get(cat_channel)
+    cat_field = cat_part.get("field") if isinstance(cat_part, dict) else None
+    mx: float | None = None
+    if isinstance(cat_field, str):
+        mx = _max_aggregated_measure(rows, cat_field, measure_field, aggregate)
+
+    for enc in (bar_enc, text_enc):
+        meas = enc.get(measure_channel)
+        if isinstance(meas, dict):
+            meas["axis"] = None
+            if mx is not None:
+                meas.setdefault("scale", {})["domainMax"] = mx * 1.18
+
+    for ch in list(text_enc):
+        if ch not in (cat_channel, measure_channel):
+            del text_enc[ch]
+
+    if cat_channel == "y":
+        text_mark: dict[str, Any] = {
+            "type": "text",
+            "align": "left",
+            "baseline": "middle",
+            "dx": 8,
+            "font": _FONT_STACK,
+            "fontSize": 15,
+            "fontWeight": 700,
+            "color": text_color,
+        }
+    else:
+        text_mark = {
+            "type": "text",
+            "align": "center",
+            "baseline": "bottom",
+            "dy": -8,
+            "font": _FONT_STACK,
+            "fontSize": 15,
+            "fontWeight": 700,
+            "color": text_color,
+        }
+
+    measure_enc_raw = enc_out.get(measure_channel)
+    if isinstance(measure_enc_raw, dict):
+        text_channel = copy.deepcopy(measure_enc_raw)
+        text_channel["format"] = ".2s"
+        text_channel["type"] = "quantitative"
+    else:
+        text_channel = {
+            "field": measure_field,
+            "type": "quantitative",
+            "format": ".2s",
+        }
+        if aggregate:
+            text_channel["aggregate"] = aggregate
+    text_enc["text"] = text_channel
+
+    return {
+        "layer": [
+            {"mark": bar_mark, "encoding": bar_enc},
+            {"mark": text_mark, "encoding": text_enc},
+        ]
+    }
+
+
+def _should_force_horizontal(
+    rows: list[dict[str, Any]],
+    category_field: str,
+    *,
+    wtype: str,
+) -> bool:
+    if wtype != "bar":
+        return False
+    cat_vals = _column_values(rows, category_field)
+    if infer_vega_type(cat_vals) != "nominal":
+        return False
+    distinct_vals = [v for v in cat_vals if v is not None and v != ""]
+    distinct = len(set(distinct_vals))
+    if distinct < 6:
+        return False
+    long_labels = sum(1 for v in distinct_vals if len(str(v)) > 12)
+    return long_labels >= max(1, distinct // 2)
+
+
+def _convert_with_design(
+    design: ChartDesign,
+    query_data: list[dict[str, Any]],
+    title: str | None,
+    *,
+    bg_tone: str,
+    palette: list[str] | None,
+    accent_color: str | None,
+) -> dict[str, Any] | None:
+    wtype = design.chart_type
+    assert wtype is not None
+    cat = design.category_field
+    assert cat is not None
+    val = design.value_field
+    series = design.series_field
+
+    horizontal = design.orientation == "horizontal"
+    if design.orientation is None and _should_force_horizontal(
+        query_data, cat, wtype=wtype
+    ):
+        horizontal = True
+
+    sort_eff, top_n_eff = _effective_sort_and_top_n(design, cat, query_data)
+
+    if wtype == "scatter":
+        chart_rows = [
+            dict(r)
+            for r in query_data
+            if cat in r
+            and val in r
+            and r.get(cat) not in (None, "")
+            and r.get(val) not in (None, "")
+        ]
+        ordered_categories: list[Any] = []
+    else:
+        chart_rows, ordered_categories = _aggregate_sort_top_n_rows(
+            query_data,
+            cat,
+            val,
+            series,
+            design.aggregate,
+            sort_eff,  # type: ignore[arg-type]
+            top_n_eff,
+        )
+
+    measure_field = val
+    if design.aggregate == "count" and not val:
+        measure_field = "__count"
+
+    if wtype != "scatter" and not chart_rows:
+        return None
+
+    base = _chart_base(chart_rows, title, tone=bg_tone, palette=palette)
+
+    if wtype == "pie":
+        if not measure_field:
+            return None
+        base["mark"] = {"type": "arc"}
+        base["encoding"] = {
+            "theta": _encoding_with_sanitized_title(
+                measure_field, chart_rows, aggregate=None
+            ),
+            "color": _encoding_with_sanitized_title(cat, chart_rows, is_color=True),
+        }
+        return base
+
+    if wtype == "scatter":
+        assert val is not None
+        enc_out: dict[str, Any] = {
+            "x": _encoding_with_sanitized_title(cat, chart_rows),
+            "y": _encoding_with_sanitized_title(val, chart_rows, aggregate=None),
+        }
+        if series:
+            enc_out["color"] = _encoding_with_sanitized_title(
+                series, chart_rows, is_color=True
+            )
+        base["mark"] = {"type": "point"}
+        base["encoding"] = enc_out
+        return base
+
+    if not measure_field:
+        return None
+
+    if horizontal:
+        enc_out = {
+            "x": _encoding_with_sanitized_title(
+                measure_field, chart_rows, aggregate=None
+            ),
+            "y": _encoding_with_sanitized_title(cat, chart_rows),
+        }
+        cat_channel = "y"
+    else:
+        enc_out = {
+            "x": _encoding_with_sanitized_title(cat, chart_rows),
+            "y": _encoding_with_sanitized_title(
+                measure_field, chart_rows, aggregate=None
+            ),
+        }
+        cat_channel = "x"
+
+    if series:
+        enc_out["color"] = _encoding_with_sanitized_title(
+            series, chart_rows, is_color=True
+        )
+    elif accent_color:
+        enc_out["color"] = {"value": accent_color}
+
+    if sort_eff != "none" and ordered_categories:
+        enc_out[cat_channel]["sort"] = list(ordered_categories)
+
+    if wtype == "bar":
+        base.update(
+            _bar_with_value_labels(
+                {"type": "bar"},
+                enc_out,
+                cat_channel=cat_channel,
+                rows=chart_rows,
+                measure_field=measure_field,
+                aggregate=None,
+                tone=bg_tone,
+            )
+        )
+    else:
+        base["mark"] = {"type": wtype}
+        base["encoding"] = enc_out
+    return base
+
+
 def _data_columns(rows: list[dict[str, Any]]) -> list[str]:
     if not rows:
         return []
@@ -397,26 +817,29 @@ def _aggregate_from_spec_field_name(field_name: str | None) -> str | None:
 def _filter_nulls_for_chart(
     widget_spec: dict[str, Any],
     rows: list[dict[str, Any]],
+    design: ChartDesign | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
-    """Drop rows with NULL in any of the chart's key fields (color, x, y).
-    Returns (cleaned_rows, n_dropped)."""
-    if not isinstance(widget_spec, dict):
-        return list(rows), 0
-    encodings = widget_spec.get("encodings") or {}
-    if not isinstance(encodings, dict):
-        encodings = {}
+    """Drop rows with NULL in chart key fields. Returns (cleaned_rows, n_dropped)."""
     keys: set[str] = set()
-    for ch in ("x", "y", "color"):
-        raw = encodings.get(ch)
-        if not isinstance(raw, dict):
-            continue
-        fn, _t = _extract_field_and_title(raw)
-        if fn and str(fn).strip():
-            s = str(fn).strip()
-            keys.add(s)
-            inner = _normalize_spec_field_name(s)
-            if inner:
-                keys.add(inner)
+    if design is not None:
+        for fn in (design.category_field, design.value_field, design.series_field):
+            if fn and str(fn).strip():
+                keys.add(str(fn).strip())
+    elif isinstance(widget_spec, dict):
+        encodings = widget_spec.get("encodings") or {}
+        if not isinstance(encodings, dict):
+            encodings = {}
+        for ch in ("x", "y", "color"):
+            raw = encodings.get(ch)
+            if not isinstance(raw, dict):
+                continue
+            fn, _t = _extract_field_and_title(raw)
+            if fn and str(fn).strip():
+                s = str(fn).strip()
+                keys.add(s)
+                inner = _normalize_spec_field_name(s)
+                if inner:
+                    keys.add(inner)
     keys.discard("")
     if not keys:
         return list(rows), 0
@@ -605,6 +1028,8 @@ def convert_widget_to_vegalite(
     query_data: list[dict[str, Any]],
     bg_tone: str = "light",
     palette: list[str] | None = None,
+    design: ChartDesign | None = None,
+    accent_color: str | None = None,
 ) -> dict[str, Any] | None:
     """
     Map a Lakeview widget spec and SQL rows to a Vega-Lite v5 spec dict.
@@ -614,17 +1039,11 @@ def convert_widget_to_vegalite(
     pass 'dark' when the chart will sit on a dark slide background.
 
     `palette` overrides the default categorical color range (e.g. brand presets).
+
+    When `design` is present and valid, it overrides heuristic chart construction.
     """
     if not query_data or not isinstance(widget_spec, dict):
         return None
-
-    wtype = str(widget_spec.get("widgetType") or "").strip().lower()
-    if wtype in ("counter", "table"):
-        return None
-
-    encodings = widget_spec.get("encodings") or {}
-    if not isinstance(encodings, dict):
-        encodings = {}
 
     columns = _data_columns(query_data)
     if not columns:
@@ -634,6 +1053,25 @@ def convert_widget_to_vegalite(
     title = (
         title_raw.strip() if isinstance(title_raw, str) and title_raw.strip() else None
     )
+
+    if _design_is_usable(design, columns):
+        assert design is not None
+        return _convert_with_design(
+            design,
+            query_data,
+            title,
+            bg_tone=bg_tone,
+            palette=palette,
+            accent_color=accent_color,
+        )
+
+    wtype = str(widget_spec.get("widgetType") or "").strip().lower()
+    if wtype in ("counter", "table"):
+        return None
+
+    encodings = widget_spec.get("encodings") or {}
+    if not isinstance(encodings, dict):
+        encodings = {}
 
     def _chart(rows: list[dict[str, Any]]) -> dict[str, Any]:
         return _chart_base(rows, title, tone=bg_tone, palette=palette)
@@ -787,8 +1225,35 @@ def convert_widget_to_vegalite(
             c_field, chart_rows, display_title=c_t, is_color=True
         )
 
-    base["mark"] = {"type": mark}
-    base["encoding"] = enc_out
+    if wtype == "bar":
+        x_type = enc_out["x"].get("type")
+        cat_channel = "x" if x_type == "nominal" else "y"
+        measure_channel = "y" if cat_channel == "x" else "x"
+        measure_part = enc_out.get(measure_channel, {})
+        m_field = (
+            measure_part.get("field", y_field)
+            if isinstance(measure_part, dict)
+            else y_field
+        )
+        m_agg = (
+            measure_part.get("aggregate", y_agg)
+            if isinstance(measure_part, dict)
+            else y_agg
+        )
+        base.update(
+            _bar_with_value_labels(
+                {"type": "bar"},
+                enc_out,
+                cat_channel=cat_channel,
+                rows=chart_rows,
+                measure_field=str(m_field),
+                aggregate=m_agg if isinstance(m_agg, str) else None,
+                tone=bg_tone,
+            )
+        )
+    else:
+        base["mark"] = {"type": mark}
+        base["encoding"] = enc_out
     return base
 
 
@@ -811,11 +1276,7 @@ def _pick_second_nominal(
 
 
 def _muted_accent_color(*, tone: str) -> str:
-    return (
-        "rgba(255,255,255,0.45)"
-        if tone == "dark"
-        else "rgba(15,15,15,0.30)"
-    )
+    return "rgba(255,255,255,0.45)" if tone == "dark" else "rgba(15,15,15,0.30)"
 
 
 def _accent_from_palette(palette: list[str] | None) -> str:
@@ -831,6 +1292,21 @@ def _resolve_encoding_channel_field(enc_part: Any) -> str | None:
     if isinstance(fn, str) and fn.strip():
         return fn.strip()
     return None
+
+
+def _quantitative_axis_and_field(enc: dict[str, Any]) -> tuple[str, str | None]:
+    """Return the measure axis/field; prefer y when both axes are quantitative."""
+    for ch in ("y", "x"):
+        part = enc.get(ch)
+        if isinstance(part, dict) and part.get("type") == "quantitative":
+            fn = _resolve_encoding_channel_field(part)
+            if fn:
+                return ch, fn
+    yf = _resolve_encoding_channel_field(enc.get("y"))
+    if yf:
+        return "y", yf
+    xf = _resolve_encoding_channel_field(enc.get("x"))
+    return "x", xf
 
 
 def _datum_expr_field(field: str) -> str:
@@ -861,7 +1337,9 @@ def _row_values_for_field(rows: list[dict[str, Any]], field: str) -> list[Any]:
     return out
 
 
-def _numeric_extent(rows: list[dict[str, Any]], field: str) -> tuple[float, float] | None:
+def _numeric_extent(
+    rows: list[dict[str, Any]], field: str
+) -> tuple[float, float] | None:
     vals: list[float] = []
     for row in rows:
         if field not in row:
@@ -946,7 +1424,7 @@ def apply_augmentation_to_spec(
         tok = tokens or {}
 
         x_field = _resolve_encoding_channel_field(enc.get("x"))
-        y_field = _resolve_encoding_channel_field(enc.get("y"))
+        qty_axis, qty_field = _quantitative_axis_and_field(enc)
 
         # --- highlight ---
         hl = augmentation.highlight
@@ -1037,12 +1515,12 @@ def apply_augmentation_to_spec(
 
         # --- y_range ---
         yr = augmentation.y_range
-        if yr is not None and len(yr) == 2 and y_field:
+        if yr is not None and len(yr) == 2 and qty_field:
             try:
                 lo_a, hi_a = float(yr[0]), float(yr[1])
-                ext = _numeric_extent(rows, y_field)
+                ext = _numeric_extent(rows, qty_field)
                 if ext is None:
-                    raise ValueError("no numeric y")
+                    raise ValueError("no numeric measure")
                 d_lo, d_hi = ext
                 if lo_a >= hi_a:
                     raise ValueError("inverted requested range")
@@ -1050,12 +1528,11 @@ def apply_augmentation_to_spec(
                 hi_c = min(hi_a, d_hi)
                 if lo_c >= hi_c:
                     raise ValueError("collapsed clamp range")
-                y_enc = enc.setdefault("y", {})
-                if isinstance(y_enc, dict):
-                    y_enc.setdefault("scale", {})
-                    if isinstance(y_enc["scale"], dict):
-                        # Preserve ints when augmentation uses ints (tests expect [10, 100])
-                        y_enc["scale"]["domain"] = [
+                qty_enc = enc.setdefault(qty_axis, {})
+                if isinstance(qty_enc, dict):
+                    qty_enc.setdefault("scale", {})
+                    if isinstance(qty_enc["scale"], dict):
+                        qty_enc["scale"]["domain"] = [
                             int(lo_c) if lo_c == int(lo_c) else lo_c,
                             int(hi_c) if hi_c == int(hi_c) else hi_c,
                         ]
@@ -1072,11 +1549,7 @@ def apply_augmentation_to_spec(
                     "duration": ",.0f",
                 }
                 if vf == "currency":
-                    cur = (
-                        str(tok.get("currency", "") or "")
-                        .strip()
-                        .upper()
-                    )
+                    cur = str(tok.get("currency", "") or "").strip().upper()
                     axis_fmt = "¥,.0f" if cur == "JPY" else "$,.0f"
                 else:
                     axis_fmt = fmt_map[vf]
@@ -1096,25 +1569,38 @@ def apply_augmentation_to_spec(
         if ref_ln is not None:
             ly_existing = out.get("layer")
             if isinstance(ly_existing, list) and len(ly_existing) > 1:
-                out["layer"] = [ly_existing[0]]
+                out["layer"] = [
+                    ly_existing[0],
+                    *[ly for ly in ly_existing[1:] if _is_value_label_layer(ly)],
+                ]
             _promote_spec_to_layer(out)
             layers = out.get("layer")
             if not isinstance(layers, list) or not layers:
                 return out
 
-            base_enc = layers[0].get("encoding") if isinstance(layers[0], dict) else None
+            base_enc = (
+                layers[0].get("encoding") if isinstance(layers[0], dict) else None
+            )
             if not isinstance(base_enc, dict):
                 return out
             xf = _resolve_encoding_channel_field(base_enc.get("x"))
             yf = _resolve_encoding_channel_field(base_enc.get("y"))
+            qty_axis, qty_field = _quantitative_axis_and_field(base_enc)
 
             try:
                 axis = str(ref_ln.axis or "").strip().lower()
                 val_raw = ref_ln.value
+                axis_part = base_enc.get(axis) if axis in ("x", "y") else None
+                if (
+                    not isinstance(axis_part, dict)
+                    or axis_part.get("type") != "quantitative"
+                ):
+                    axis = qty_axis
                 if axis == "y":
-                    if not yf:
+                    field_for_rule = yf or qty_field
+                    if not field_for_rule:
                         raise ValueError("missing y")
-                    ext = _numeric_extent(rows, yf)
+                    ext = _numeric_extent(rows, field_for_rule)
                     if ext is None:
                         raise ValueError("no numeric extent")
                     v = float(val_raw)
@@ -1151,20 +1637,26 @@ def apply_augmentation_to_spec(
                             }
                         )
                 elif axis == "x":
-                    if not xf:
+                    field_for_rule = xf or qty_field
+                    if not field_for_rule:
                         raise ValueError("missing x")
-                    domain_x = _ordinal_domain(rows, xf)
-                    if not domain_x:
-                        raise ValueError("empty x domain")
-                    try:
-                        v_raw_num = float(val_raw)
-                        ext_x = _numeric_extent(rows, xf)
+                    domain_x = _ordinal_domain(rows, field_for_rule)
+                    if domain_x:
+                        try:
+                            v_raw_num = float(val_raw)
+                            ext_x = _numeric_extent(rows, field_for_rule)
+                            if ext_x is None:
+                                raise ValueError("non-numeric x band")
+                            v = max(ext_x[0], min(ext_x[1], v_raw_num))
+                            datum_x: Any = int(v) if v == int(v) else v
+                        except Exception:
+                            datum_x = val_raw
+                    else:
+                        ext_x = _numeric_extent(rows, field_for_rule)
                         if ext_x is None:
-                            raise ValueError("non-numeric x band")
-                        v = max(ext_x[0], min(ext_x[1], v_raw_num))
-                        datum_x: Any = int(v) if v == int(v) else v
-                    except Exception:
-                        datum_x = val_raw
+                            raise ValueError("non-numeric x")
+                        v = max(ext_x[0], min(ext_x[1], float(val_raw)))
+                        datum_x = int(v) if v == int(v) else v
                     layers.append(
                         {
                             "mark": {

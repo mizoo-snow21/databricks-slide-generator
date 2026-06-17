@@ -11,6 +11,7 @@ from pptx import Presentation
 from main import app
 from models import (
     ChartAugmentation,
+    ChartDesign,
     ChartHighlight,
     Deck,
     DesignTokens,
@@ -21,7 +22,9 @@ from models import (
 )
 from routers.decks import (
     _check_placeholder_leak,
+    _prerender_widget_chart_data_uris,
     _tokens_dict_from_template,
+    deck_job_store,
     deck_repo,
     get_deck_service,
 )
@@ -47,6 +50,10 @@ def _bar_chart_genie_answer() -> GenieAnswer:
     )
 
 
+def _wait_job(job_id: str, timeout: float = 15.0):
+    return deck_job_store.wait(job_id, timeout=timeout)
+
+
 def _patch_ask_many(
     answers: list[GenieAnswer] | None = None,
     warnings: list[str] | None = None,
@@ -63,8 +70,10 @@ def _patch_ask_many(
 @pytest.fixture(autouse=True)
 def clear_deck_repo() -> None:
     deck_repo.clear()
+    deck_job_store.clear()
     yield
     deck_repo.clear()
+    deck_job_store.clear()
 
 
 def test_list_decks_empty() -> None:
@@ -321,8 +330,13 @@ def test_create_deck_high_quality_audit_failure_returns_503(
                 "high_quality": True,
             },
         )
-    assert response.status_code == 503
-    assert "High-quality audit failed" in response.json()["detail"]
+        assert response.status_code == 202
+        job_id = response.json()["job_id"]
+        job = _wait_job(job_id)
+    assert job is not None
+    assert job.status == "error"
+    assert job.status_code == 503
+    assert "High-quality audit failed" in (job.error or "")
 
 
 def test_create_deck_applies_brand_palette_for_preset(stub_obo_dependency) -> None:
@@ -386,7 +400,11 @@ def test_create_deck_applies_brand_palette_for_preset(stub_obo_dependency) -> No
                 "high_quality": False,
             },
         )
-    assert r.status_code == 201, r.text
+        assert r.status_code == 202, r.text
+        job_id = r.json()["job_id"]
+        job = _wait_job(job_id)
+    assert job is not None
+    assert job.status == "done"
     assert captured, "convert_widget_to_vegalite should have been called"
     assert (
         captured[0]["config"]["range"]["category"]
@@ -441,7 +459,11 @@ def test_create_deck_appends_genie_warnings_for_failed_questions(
                 "high_quality": False,
             },
         )
-    assert r.status_code == 201, r.text
+        assert r.status_code == 202, r.text
+        job_id = r.json()["job_id"]
+        job = _wait_job(job_id)
+    assert job is not None
+    assert job.status == "done"
     warnings = mock_svc.generate_deck.call_args.kwargs["chart_warnings"]
     assert any("Slow question" in w for w in warnings)
     assert mock_svc.generate_deck.call_args.kwargs["genie_space_id"] == "space-1"
@@ -473,8 +495,13 @@ def test_create_deck_all_genie_questions_failed_returns_502(
                 "high_quality": False,
             },
         )
-    assert r.status_code == 502
-    assert "All questions failed" in r.json()["detail"]
+        assert r.status_code == 202
+        job_id = r.json()["job_id"]
+        job = _wait_job(job_id)
+    assert job is not None
+    assert job.status == "error"
+    assert job.status_code == 502
+    assert "All questions failed" in (job.error or "")
 
 
 def test_create_deck_appends_null_filter_warning_when_rows_dropped(
@@ -529,7 +556,11 @@ def test_create_deck_appends_null_filter_warning_when_rows_dropped(
                 "high_quality": False,
             },
         )
-    assert r.status_code == 201, r.text
+        assert r.status_code == 202, r.text
+        job_id = r.json()["job_id"]
+        job = _wait_job(job_id)
+    assert job is not None
+    assert job.status == "done"
     warnings = mock_svc.generate_deck.call_args.kwargs["chart_warnings"]
     joined = " ".join(warnings).lower()
     assert "chart skipped" in joined or "null" in joined
@@ -603,9 +634,19 @@ def test_create_deck_applies_augmentation_when_llm_returns_one(
                 "high_quality": False,
             },
         )
-    assert r.status_code == 201, r.text
+        assert r.status_code == 202, r.text
+        job_id = r.json()["job_id"]
+        job = _wait_job(job_id)
+    assert job is not None
+    assert job.status == "done"
     assert captured
-    color_enc = captured[0].get("encoding", {}).get("color")
+    spec0 = captured[0]
+    enc0 = (
+        spec0.get("layer", [{}])[0].get("encoding")
+        if "layer" in spec0
+        else spec0.get("encoding")
+    ) or {}
+    color_enc = enc0.get("color")
     assert color_enc is not None
     assert "condition" in color_enc
 
@@ -667,9 +708,82 @@ def test_create_deck_no_augmentation_when_llm_fails(
                 "high_quality": False,
             },
         )
-    assert r.status_code == 201, r.text
+        assert r.status_code == 202, r.text
+        job_id = r.json()["job_id"]
+        job = _wait_job(job_id)
+    assert job is not None
+    assert job.status == "done"
     assert captured
     assert "color" not in captured[0].get("encoding", {})
+
+
+def test_create_deck_returns_job_then_completes(stub_obo_dependency) -> None:
+    created = templates_service.create(
+        TemplateCreate(
+            name="Happy Path Template",
+            description="",
+            google_slides_template_id="gs",
+        ),
+        user_id="u",
+    )
+    fake_deck = Deck(
+        id="happy-deck",
+        user_id="demo-user",
+        template_id=created.id,
+        genie_space_id="space-1",
+        google_slides_template_id="gs",
+        html_doc="<html><body></body></html>",
+        design_tokens={},
+        theme_markdown="",
+        status="draft",
+    )
+    mock_svc = MagicMock(spec=DeckService)
+    mock_svc.generate_deck.return_value = fake_deck
+    mock_svc.get_deck.return_value = fake_deck
+    app.dependency_overrides[get_deck_service] = lambda: mock_svc
+
+    client = TestClient(app)
+    with (
+        _patch_ask_many(),
+        patch(
+            "routers.decks._prerender_widget_chart_data_uris",
+            return_value=({}, {}),
+        ),
+    ):
+        response = client.post(
+            "/api/decks",
+            json={
+                "template_id": created.id,
+                "genie_space_id": "space-1",
+                "questions": ["Revenue by month?"],
+                "high_quality": False,
+            },
+        )
+        assert response.status_code == 202
+        body = response.json()
+        assert body["status"] == "running"
+        job_id = body["job_id"]
+        job = _wait_job(job_id)
+    assert job is not None
+    assert job.status == "done"
+    assert job.deck_id == "happy-deck"
+
+    poll = client.get(f"/api/decks/jobs/{job_id}")
+    assert poll.status_code == 200
+    poll_body = poll.json()
+    assert poll_body["status"] == "done"
+    assert poll_body["deck_id"] == "happy-deck"
+
+    deck_resp = client.get("/api/decks/happy-deck")
+    assert deck_resp.status_code == 200
+    assert deck_resp.json()["id"] == "happy-deck"
+
+
+def test_get_deck_job_unknown_returns_404() -> None:
+    client = TestClient(app)
+    r = client.get("/api/decks/jobs/does-not-exist")
+    assert r.status_code == 404
+    assert r.json()["detail"] == "Job not found"
 
 
 def test_post_deck_outline_uses_genie_answers(stub_obo_dependency) -> None:
@@ -697,12 +811,160 @@ def test_post_deck_outline_uses_genie_answers(stub_obo_dependency) -> None:
                 "questions": ["Revenue by month?"],
             },
         )
-    assert r.status_code == 200, r.text
+        assert r.status_code == 202, r.text
+        assert r.json()["status"] == "running"
+        job_id = r.json()["job_id"]
+        job = _wait_job(job_id)
+    assert job is not None and job.status == "done"
     widgets = mock_svc.generate_outline.call_args.kwargs["widgets"]
     assert len(widgets) == 1
     assert widgets[0].widget_id == "q0"
     assert widgets[0].query_result_summary
     assert widgets[0].row_count == 1
+
+
+def test_outline_job_happy_path_poll_returns_slides(stub_obo_dependency) -> None:
+    created = templates_service.create(
+        TemplateCreate(
+            name="Outline Poll Template",
+            description="",
+            google_slides_template_id="gs",
+        ),
+        user_id="u",
+    )
+    mock_svc = MagicMock(spec=DeckService)
+    mock_svc.generate_outline.return_value = [
+        {"layout": "title", "title": "Cover", "summary": "Intro", "notes": ""},
+        {"layout": "content", "title": "Body", "summary": "Details", "notes": "n"},
+    ]
+    app.dependency_overrides[get_deck_service] = lambda: mock_svc
+
+    client = TestClient(app)
+    with _patch_ask_many():
+        r = client.post(
+            "/api/decks/outline",
+            json={
+                "template_id": created.id,
+                "genie_space_id": "space-1",
+                "questions": ["Revenue by month?"],
+            },
+        )
+        assert r.status_code == 202
+        job_id = r.json()["job_id"]
+        job = _wait_job(job_id)
+    assert job is not None and job.status == "done"
+
+    poll = client.get(f"/api/decks/outline/jobs/{job_id}")
+    assert poll.status_code == 200
+    body = poll.json()
+    assert body["status"] == "done"
+    assert len(body["slides"]) == 2
+    assert body["slides"][0]["title"] == "Cover"
+    assert body["slides"][1]["title"] == "Body"
+
+
+def test_get_outline_job_unknown_returns_404() -> None:
+    client = TestClient(app)
+    r = client.get("/api/decks/outline/jobs/does-not-exist")
+    assert r.status_code == 404
+    assert r.json()["detail"] == "Job not found"
+
+
+def test_outline_and_deck_job_kind_isolation(stub_obo_dependency) -> None:
+    created = templates_service.create(
+        TemplateCreate(
+            name="Kind Isolation Template",
+            description="",
+            google_slides_template_id="gs",
+        ),
+        user_id="u",
+    )
+    fake_deck = Deck(
+        id="kind-deck",
+        user_id="demo-user",
+        template_id=created.id,
+        genie_space_id="space-1",
+        google_slides_template_id="gs",
+        html_doc="<html><body></body></html>",
+        design_tokens={},
+        theme_markdown="",
+        status="draft",
+    )
+    mock_svc = MagicMock(spec=DeckService)
+    mock_svc.generate_deck.return_value = fake_deck
+    mock_svc.generate_outline.return_value = [
+        {"layout": "title", "title": "Cover", "summary": "Intro", "notes": ""},
+    ]
+    app.dependency_overrides[get_deck_service] = lambda: mock_svc
+
+    client = TestClient(app)
+    with (
+        _patch_ask_many(),
+        patch(
+            "routers.decks._prerender_widget_chart_data_uris",
+            return_value=({}, {}),
+        ),
+    ):
+        deck_r = client.post(
+            "/api/decks",
+            json={
+                "template_id": created.id,
+                "genie_space_id": "space-1",
+                "questions": ["Revenue by month?"],
+                "high_quality": False,
+            },
+        )
+        assert deck_r.status_code == 202
+        deck_job_id = deck_r.json()["job_id"]
+        _wait_job(deck_job_id)
+
+        outline_r = client.post(
+            "/api/decks/outline",
+            json={
+                "template_id": created.id,
+                "genie_space_id": "space-1",
+                "questions": ["Revenue by month?"],
+            },
+        )
+        assert outline_r.status_code == 202
+        outline_job_id = outline_r.json()["job_id"]
+        _wait_job(outline_job_id)
+
+    assert client.get(f"/api/decks/outline/jobs/{deck_job_id}").status_code == 404
+    assert client.get(f"/api/decks/jobs/{outline_job_id}").status_code == 404
+
+
+def test_outline_all_genie_questions_failed_returns_502(stub_obo_dependency) -> None:
+    created = templates_service.create(
+        TemplateCreate(
+            name="Outline Genie Fail Template",
+            description="",
+            google_slides_template_id="gs",
+        ),
+        user_id="u",
+    )
+    client = TestClient(app)
+    with _patch_ask_many(answers=[], warnings=["Q1: failed", "Q2: failed"]):
+        r = client.post(
+            "/api/decks/outline",
+            json={
+                "template_id": created.id,
+                "genie_space_id": "space-1",
+                "questions": ["Q1", "Q2"],
+            },
+        )
+        assert r.status_code == 202
+        job_id = r.json()["job_id"]
+        job = _wait_job(job_id)
+    assert job is not None
+    assert job.status == "error"
+    assert job.status_code == 502
+    assert "All questions failed" in (job.error or "")
+
+    poll = client.get(f"/api/decks/outline/jobs/{job_id}")
+    assert poll.status_code == 200
+    assert poll.json()["status"] == "error"
+    assert poll.json()["status_code"] == 502
 
 
 def _template_without_tokens(*, theme: str) -> Template:
@@ -766,3 +1028,161 @@ def test_present_tokens_returned_verbatim() -> None:
         tokens=explicit_tokens,
     )
     assert _tokens_dict_from_template(template) == explicit_tokens.model_dump()
+
+
+def _many_category_rows(n: int = 10) -> list[dict[str, float | str]]:
+    return [{"category": f"C{i}", "value": float(i + 1)} for i in range(n)]
+
+
+def test_prerender_widgets_with_data_includes_field_stats() -> None:
+    import routers.decks as decks_rt
+
+    rows = _many_category_rows(10)
+    widgets = [
+        WidgetInfo(
+            widget_id="q0",
+            title="Rank",
+            viz_type="auto",
+            columns=["category", "value"],
+            row_count=len(rows),
+        )
+    ]
+    captured: list[dict] = []
+
+    def capture_llm(widgets_with_data: list[dict], **kwargs: object) -> list:
+        captured.extend(widgets_with_data)
+        return []
+
+    with (
+        patch.object(
+            decks_rt._deck_llm,
+            "augment_chart_specs_for_deck",
+            side_effect=capture_llm,
+        ),
+        patch(
+            "services.pptx_slides_service._render_chart_to_png",
+            return_value=TINY_PNG,
+        ),
+    ):
+        _prerender_widget_chart_data_uris(widgets, {"q0": rows})
+
+    assert len(captured) == 1
+    stats = captured[0].get("field_stats")
+    assert isinstance(stats, dict)
+    assert stats["category"]["distinct_count"] == 10
+    assert stats["value"]["min"] == 1.0
+    assert stats["value"]["max"] == 10.0
+
+
+def test_prerender_applies_design_top_n_to_chart_data() -> None:
+    import routers.decks as decks_rt
+
+    rows = _many_category_rows(10)
+    widgets = [
+        WidgetInfo(
+            widget_id="q0",
+            title="Rank",
+            viz_type="auto",
+            columns=["category", "value"],
+            row_count=len(rows),
+        )
+    ]
+    render_calls: list[dict] = []
+
+    def capture_render(vl: dict) -> bytes:
+        render_calls.append(vl)
+        return TINY_PNG
+
+    with (
+        patch.object(
+            decks_rt._deck_llm,
+            "augment_chart_specs_for_deck",
+            return_value=[
+                ChartAugmentation(
+                    widget_id="q0",
+                    design=ChartDesign(
+                        chart_type="bar",
+                        category_field="category",
+                        value_field="value",
+                        aggregate="sum",
+                        sort="value_desc",
+                        top_n=3,
+                    ),
+                )
+            ],
+        ),
+        patch(
+            "services.pptx_slides_service._render_chart_to_png",
+            side_effect=capture_render,
+        ),
+    ):
+        charts, _errors = _prerender_widget_chart_data_uris(widgets, {"q0": rows})
+
+    assert "q0" in charts
+    assert render_calls
+    cats = {r["category"] for r in render_calls[0]["data"]["values"]}
+    assert len(cats) <= 3
+
+
+def test_prerender_passes_rendered_rows_to_augmentation() -> None:
+    import routers.decks as decks_rt
+    import services.vegalite_service as vegalite_mod
+
+    rows = _many_category_rows(10)
+    widgets = [
+        WidgetInfo(
+            widget_id="q0",
+            title="Rank",
+            viz_type="auto",
+            columns=["category", "value"],
+            row_count=len(rows),
+        )
+    ]
+    rows_passed_to_aug: list[list[dict]] = []
+    orig_apply = vegalite_mod.apply_augmentation_to_spec
+
+    def capture_apply(
+        vl: dict,
+        aug_rows: list[dict],
+        aug: ChartAugmentation,
+        **kwargs: object,
+    ) -> dict:
+        rows_passed_to_aug.append(list(aug_rows))
+        return orig_apply(vl, aug_rows, aug, **kwargs)
+
+    with (
+        patch.object(
+            decks_rt._deck_llm,
+            "augment_chart_specs_for_deck",
+            return_value=[
+                ChartAugmentation(
+                    widget_id="q0",
+                    design=ChartDesign(
+                        chart_type="bar",
+                        category_field="category",
+                        value_field="value",
+                        aggregate="sum",
+                        sort="value_desc",
+                        top_n=3,
+                    ),
+                    highlight=ChartHighlight(field="category", values=["C9"]),
+                )
+            ],
+        ),
+        patch.object(
+            vegalite_mod,
+            "apply_augmentation_to_spec",
+            side_effect=capture_apply,
+        ),
+        patch(
+            "services.pptx_slides_service._render_chart_to_png",
+            return_value=TINY_PNG,
+        ),
+    ):
+        charts, _errors = _prerender_widget_chart_data_uris(widgets, {"q0": rows})
+
+    assert "q0" in charts
+    assert len(rows_passed_to_aug) == 1
+    rendered_cats = {r["category"] for r in rows_passed_to_aug[0]}
+    assert len(rendered_cats) <= 3
+    assert "C9" in rendered_cats

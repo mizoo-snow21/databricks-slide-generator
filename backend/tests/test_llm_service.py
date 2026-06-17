@@ -600,3 +600,208 @@ def test_augment_chart_specs_calls_edit_endpoint() -> None:
             tokens={},
         )
     assert mocked.call_args.kwargs.get("endpoint") == svc._edit_endpoint
+
+
+class _FakeWs:
+    class _FakeCfg:
+        host = "https://test.databricks.com"
+
+        def authenticate(self) -> dict[str, str]:
+            return {"Authorization": "Bearer fake-token"}
+
+    config = _FakeCfg()
+
+
+def _widgets_with_fields() -> list[dict]:
+    return [
+        {
+            "widget_id": "w1",
+            "title": "Top users",
+            "available_fields": ["user_email", "event_count"],
+            "rows_sample": [
+                {"user_email": "a@x.com", "event_count": 42},
+                {"user_email": "b@x.com", "event_count": 17},
+            ],
+        }
+    ]
+
+
+def test_augment_chart_specs_parses_valid_design() -> None:
+    svc = LLMService(workspace_client=_FakeWs())
+    payload = {
+        "augmentations": [
+            {
+                "widget_id": "w1",
+                "highlight": {"field": "user_email", "values": ["a@x.com"]},
+                "caption": "Leader",
+                "design": {
+                    "chart_type": "bar",
+                    "category_field": "user_email",
+                    "value_field": "event_count",
+                    "series_field": None,
+                    "aggregate": "none",
+                    "sort": "value_desc",
+                    "top_n": 10,
+                    "orientation": "horizontal",
+                },
+            }
+        ]
+    }
+    with patch.object(
+        svc,
+        "_foundation_model_chat_sync",
+        return_value=json.dumps(payload),
+    ):
+        out = svc.augment_chart_specs_for_deck(
+            widgets_with_data=_widgets_with_fields(),
+            slide_outline=[],
+            tokens={},
+        )
+    assert len(out) == 1
+    aug = out[0]
+    assert aug.widget_id == "w1"
+    assert aug.caption == "Leader"
+    assert aug.highlight is not None
+    assert aug.design is not None
+    assert aug.design.chart_type == "bar"
+    assert aug.design.category_field == "user_email"
+    assert aug.design.value_field == "event_count"
+    assert aug.design.sort == "value_desc"
+    assert aug.design.top_n == 10
+    assert aug.design.orientation == "horizontal"
+
+
+def test_augment_chart_specs_nulls_bad_design_preserves_decoration() -> None:
+    svc = LLMService(workspace_client=_FakeWs())
+    payload = {
+        "augmentations": [
+            {
+                "widget_id": "w1",
+                "highlight": {"field": "user_email", "values": ["a@x.com"]},
+                "caption": "Keep me",
+                "design": {
+                    "chart_type": "bar",
+                    "category_field": "not_a_real_field",
+                    "value_field": "event_count",
+                    "aggregate": "none",
+                    "sort": "value_desc",
+                    "top_n": 8,
+                },
+            }
+        ]
+    }
+    with patch.object(
+        svc,
+        "_foundation_model_chat_sync",
+        return_value=json.dumps(payload),
+    ):
+        out = svc.augment_chart_specs_for_deck(
+            widgets_with_data=_widgets_with_fields(),
+            slide_outline=[],
+            tokens={},
+        )
+    assert len(out) == 1
+    aug = out[0]
+    assert aug.design is None
+    assert aug.caption == "Keep me"
+    assert aug.highlight is not None
+    assert aug.highlight.field == "user_email"
+
+
+def test_augment_chart_specs_drops_only_invalid_widget_on_schema_error() -> None:
+    svc = LLMService(workspace_client=_FakeWs())
+    payload = {
+        "augmentations": [
+            {
+                "highlight": None,
+                "design": {"chart_type": "bar"},
+            },
+            {
+                "widget_id": "w1",
+                "caption": "valid widget",
+                "design": {
+                    "chart_type": "line",
+                    "category_field": "user_email",
+                    "value_field": "event_count",
+                },
+            },
+        ]
+    }
+    with patch.object(
+        svc,
+        "_foundation_model_chat_sync",
+        return_value=json.dumps(payload),
+    ):
+        out = svc.augment_chart_specs_for_deck(
+            widgets_with_data=_widgets_with_fields(),
+            slide_outline=[],
+            tokens={},
+        )
+    assert len(out) == 1
+    assert out[0].widget_id == "w1"
+    assert out[0].caption == "valid widget"
+    assert out[0].design is not None
+    assert out[0].design.chart_type == "line"
+
+
+def test_augment_chart_specs_decoration_only_without_design() -> None:
+    svc = LLMService(workspace_client=_FakeWs())
+    payload = {
+        "augmentations": [
+            {
+                "widget_id": "w1",
+                "highlight": {"field": "user_email", "values": ["a@x.com"]},
+                "reference_line": {"axis": "y", "value": 30, "label": "avg"},
+                "value_format": "count",
+                "caption": "Plain decoration",
+            }
+        ]
+    }
+    with patch.object(
+        svc,
+        "_foundation_model_chat_sync",
+        return_value=json.dumps(payload),
+    ):
+        out = svc.augment_chart_specs_for_deck(
+            widgets_with_data=_widgets_with_fields(),
+            slide_outline=[],
+            tokens={},
+        )
+    assert len(out) == 1
+    aug = out[0]
+    assert aug.widget_id == "w1"
+    assert aug.design is None
+    assert aug.caption == "Plain decoration"
+    assert aug.value_format == "count"
+    assert aug.reference_line is not None
+
+
+def test_augment_chart_specs_clamps_top_n() -> None:
+    svc = LLMService(workspace_client=_FakeWs())
+    payload = {
+        "augmentations": [
+            {
+                "widget_id": "w1",
+                "design": {
+                    "chart_type": "bar",
+                    "category_field": "user_email",
+                    "value_field": "event_count",
+                    "sort": "value_desc",
+                    "top_n": 999,
+                },
+            }
+        ]
+    }
+    with patch.object(
+        svc,
+        "_foundation_model_chat_sync",
+        return_value=json.dumps(payload),
+    ):
+        out = svc.augment_chart_specs_for_deck(
+            widgets_with_data=_widgets_with_fields(),
+            slide_outline=[],
+            tokens={},
+        )
+    assert len(out) == 1
+    assert out[0].design is not None
+    assert out[0].design.top_n == 20

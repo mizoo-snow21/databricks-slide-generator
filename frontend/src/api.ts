@@ -1,9 +1,11 @@
 import type {
   AuditResponse,
   Deck,
+  DeckJobStatus,
   DeckMutationResponse,
   DesignTokens,
   GenieSpaceInfo,
+  OutlineJobStatus,
   OutlineSlide,
   PendingComment,
   PptxExtractResult,
@@ -157,19 +159,23 @@ export const api = {
     return fetchJson<Deck>(`/api/decks/${encodeURIComponent(id)}`);
   },
 
-  async createDeck(body: {
+  async createDeckJob(body: {
     template_id: string;
     genie_space_id: string;
     questions: string[];
     user_prompt?: string;
     outline?: OutlineSlide[];
     high_quality?: boolean;
-  }): Promise<Deck> {
-    return fetchJson<Deck>("/api/decks", {
+  }): Promise<{ job_id: string; status: string }> {
+    return fetchJson<{ job_id: string; status: string }>("/api/decks", {
       method: "POST",
       headers: jsonHeaders,
       body: JSON.stringify(body),
     });
+  },
+
+  async getDeckJob(jobId: string): Promise<DeckJobStatus> {
+    return fetchJson<DeckJobStatus>(`/api/decks/jobs/${encodeURIComponent(jobId)}`);
   },
 
   async importPptx(file: File, templateId: string): Promise<Deck> {
@@ -193,19 +199,25 @@ export const api = {
     });
   },
 
-  async generateOutline(body: {
+  async startOutlineJob(body: {
     template_id: string;
     genie_space_id: string;
     questions: string[];
     user_prompt?: string;
     reference_doc?: string;
     reference_doc_name?: string;
-  }): Promise<{ slides: OutlineSlide[] }> {
-    return fetchJson<{ slides: OutlineSlide[] }>("/api/decks/outline", {
+  }): Promise<{ job_id: string; status: string }> {
+    return fetchJson<{ job_id: string; status: string }>("/api/decks/outline", {
       method: "POST",
       headers: jsonHeaders,
       body: JSON.stringify(body),
     });
+  },
+
+  async getOutlineJob(jobId: string): Promise<OutlineJobStatus> {
+    return fetchJson<OutlineJobStatus>(
+      `/api/decks/outline/jobs/${encodeURIComponent(jobId)}`,
+    );
   },
 
   async uploadOutlineReferenceDoc(file: File): Promise<{

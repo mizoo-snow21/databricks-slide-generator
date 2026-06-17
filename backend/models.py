@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -184,6 +184,22 @@ class GenerationRequest(BaseModel):
     high_quality: bool = True
 
 
+class DeckJobResponse(BaseModel):
+    job_id: str
+    status: str  # "running" | "done" | "error"
+    deck_id: str | None = None
+    error: str | None = None
+    status_code: int | None = None
+
+
+class OutlineJobResponse(BaseModel):
+    job_id: str
+    status: str  # "running" | "done" | "error"
+    slides: list[OutlineSlide] | None = None
+    error: str | None = None
+    status_code: int | None = None
+
+
 class GenerationResult(BaseModel):
     slides_url: str
     slide_count: int
@@ -203,6 +219,17 @@ class ChartReferenceLine(BaseModel):
     label: str
 
 
+class ChartDesign(BaseModel):
+    chart_type: Literal["bar", "line", "area", "pie", "scatter"] | None = None
+    category_field: str | None = None
+    value_field: str | None = None
+    series_field: str | None = None
+    aggregate: Literal["sum", "avg", "count", "none"] = "none"
+    sort: Literal["value_desc", "value_asc", "category", "none"] = "none"
+    top_n: int | None = Field(default=None, ge=1, le=20)
+    orientation: Literal["horizontal", "vertical"] | None = None
+
+
 class ChartAugmentation(BaseModel):
     """Per-widget chart augmentation from LLM. Omitted / empty fields mean plain."""
 
@@ -212,3 +239,4 @@ class ChartAugmentation(BaseModel):
     reference_line: ChartReferenceLine | None = None
     value_format: str | None = None  # currency | percent | count | duration
     caption: str | None = None
+    design: ChartDesign | None = None

@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useMemo, useState, type ChangeEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../api";
 import { ProgressIndicator } from "../components/ProgressIndicator";
 import type { GenieSpaceInfo, OutlineSlide, Template } from "../types";
 import { resolveQuestions } from "./generateRequest";
+import { DeckJobCancelledError, pollDeckJob } from "./pollDeckJob";
 
 const GENERATION_STEPS = [
   "Capture widgets",
@@ -71,6 +72,14 @@ export default function GeneratePage() {
   const [addedQuestions, setAddedQuestions] = useState<string[]>([]);
   const [customQuestion, setCustomQuestion] = useState("");
   const [space, setSpace] = useState<GenieSpaceInfo | null>(null);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!spaceId) {
@@ -161,7 +170,7 @@ export default function GeneratePage() {
       setError(null);
       setPhase("outlining");
       try {
-        const body: Parameters<typeof api.generateOutline>[0] = {
+        const body: Parameters<typeof api.startOutlineJob>[0] = {
           template_id: templateId,
           genie_space_id: spaceId,
           questions,
@@ -171,10 +180,16 @@ export default function GeneratePage() {
           body.reference_doc = referenceDoc;
           body.reference_doc_name = referenceDocName;
         }
-        const { slides } = await api.generateOutline(body);
-        setOutlineSlides(slides.map((s) => ({ ...s, notes: s.notes ?? "" })));
+        const { job_id } = await api.startOutlineJob(body);
+        const job = await pollDeckJob(api.getOutlineJob, job_id, {
+          shouldStop: () => !mountedRef.current,
+        });
+        if (!mountedRef.current) return;
+        if (!job.slides?.length) throw new Error("Outline generation returned no slides");
+        setOutlineSlides(job.slides.map((s) => ({ ...s, notes: s.notes ?? "" })));
         setPhase("outline-review");
       } catch (e) {
+        if (e instanceof DeckJobCancelledError) return;
         setError(e instanceof Error ? e.message : "Outline generation failed");
         setPhase(failPhase);
       }
@@ -202,7 +217,7 @@ export default function GeneratePage() {
     setPhase("generating");
     setProgressStep(0);
     try {
-      const deck = await api.createDeck({
+      const { job_id } = await api.createDeckJob({
         template_id: templateId,
         genie_space_id: spaceId,
         questions,
@@ -210,14 +225,19 @@ export default function GeneratePage() {
         outline: outlineSlides,
         high_quality: highQuality,
       });
+      const job = await pollDeckJob(api.getDeckJob, job_id, {
+        shouldStop: () => !mountedRef.current,
+      });
+      if (!mountedRef.current) return;
       setProgressStep(GENERATION_STEPS.length - 1);
       try {
         localStorage.removeItem(`genieSlide:outlineDraft:${templateId}:${spaceId}`);
       } catch {
         /* ignore */
       }
-      navigate(`/decks/${deck.id}/edit`);
+      navigate(`/decks/${job.deck_id}/edit`);
     } catch (e) {
+      if (e instanceof DeckJobCancelledError) return;
       setError(e instanceof Error ? e.message : "Generation failed");
       setPhase("outline-review");
     }
